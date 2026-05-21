@@ -77,10 +77,10 @@ def test_search_with_filter_paths_does_not_crash(indexed_index: SembleIndex) -> 
 
 def test_search_without_reranking(indexed_index: SembleIndex) -> None:
     """Filtered search works regardless of where the selected chunk lives in the corpus."""
-    with patch("semble.search.rerank_topk") as mock:
+    with patch("semble.ranking.rerank_topk") as mock:
         indexed_index.search("function", top_k=3, rerank=False)
         mock.assert_not_called()
-    with patch("semble.search.rerank_topk") as mock:
+    with patch("semble.ranking.rerank_topk") as mock:
         indexed_index.search("function", top_k=3, rerank=True)
         mock.assert_called()
 

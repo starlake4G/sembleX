@@ -10,9 +10,11 @@ import watchfiles
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from semble.index import SembleIndex
-from semble.index.dense import load_model
-from semble.types import Encoder
+from semble.backends.embedding import create_embedding_provider
+from semble.cache.manager import CacheManager
+from semble.config import SembleConfig
+from semble.interfaces import EmbeddingProvider
+from semble.monitor import FileMonitor
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 
 logger = logging.getLogger(__name__)
@@ -23,15 +25,14 @@ _REPO_DESCRIPTION = (
     "The index is cached after the first call, so repeat queries are fast."
 )
 
-_CACHE_MAX_SIZE = 10  # Max number of cached indexes to keep in memory
+_CACHE_MAX_SIZE = 10
 
 
 async def _get_index(
     repo: str | None,
     default_source: str | None,
     cache: _IndexCache,
-) -> SembleIndex:
-    """Return a cached index for a repo, rejecting unsafe git transport schemes."""
+) -> "SembleIndex":
     if repo is not None and _is_git_url(repo) and not repo.startswith(("https://", "http://")):
         raise ValueError(f"Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo!r}")
     source = repo or default_source
@@ -47,7 +48,6 @@ async def _get_index(
 
 
 def create_server(cache: _IndexCache, default_source: str | None = None) -> FastMCP:
-    """Build and return a configured FastMCP server backed by the given cache."""
     server = FastMCP(
         "semble",
         instructions=(
@@ -65,11 +65,6 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
         top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 5,
     ) -> str:
-        """Search a codebase with a natural-language or code query.
-
-        Pass a git URL or local path as `repo` to index it on demand; indexes are cached for the session.
-        Use this to find where something is implemented, understand a library, or locate related code.
-        """
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
@@ -89,11 +84,6 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
         repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
         top_k: Annotated[int, Field(description="Number of similar chunks to return.", ge=1)] = 5,
     ) -> str:
-        """Find code chunks semantically similar to a specific location in a file.
-
-        Use after `search` to explore related implementations or callers.
-        Pass file_path and line from a prior search result.
-        """
         try:
             index = await _get_index(repo, default_source, cache)
         except ValueError as exc:
@@ -112,13 +102,20 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
     return server
 
 
-async def serve(path: str | None = None, ref: str | None = None, include_text_files: bool = False) -> None:
-    """Start an MCP stdio server, optionally pre-indexing a default source."""
-    model = await asyncio.to_thread(load_model)
-    cache = _IndexCache(model=model, include_text_files=include_text_files)
+async def serve(
+    path: str | None = None,
+    ref: str | None = None,
+    include_text_files: bool = False,
+    config: SembleConfig | None = None,
+) -> None:
+    from semble.index.index import SembleIndex
+
+    cfg = config or SembleConfig()
+    model = await asyncio.to_thread(create_embedding_provider, cfg.embedding)
+    cache = _IndexCache(model=model, config=cfg, include_text_files=include_text_files)
     if path:
         await cache.get(path, ref=ref)
-        if not _is_git_url(path):
+        if not _is_git_url(path) and cfg.monitor.enabled:
             await cache.start_watcher(path)
 
     server = create_server(cache, default_source=path)
@@ -126,17 +123,15 @@ async def serve(path: str | None = None, ref: str | None = None, include_text_fi
 
 
 class _IndexCache:
-    """Cache of indexed repos and local paths for the lifetime of the MCP server process."""
-
-    def __init__(self, model: Encoder, include_text_files: bool = False) -> None:
-        """Initialise an empty cache with a shared embedding model."""
+    def __init__(self, model: EmbeddingProvider, config: SembleConfig, include_text_files: bool = False) -> None:
         self._model = model
+        self._config = config
         self._include_text_files = include_text_files
-        self._tasks: OrderedDict[str, asyncio.Task[SembleIndex]] = OrderedDict()  # ordered for LRU eviction
-        self._watcher_task: asyncio.Task[None] | None = None
+        self._tasks: OrderedDict[str, asyncio.Task] = OrderedDict()
+        self._watcher_task: asyncio.Task | None = None
+        self._disk_cache = CacheManager(config.cache.dir, config) if config.cache.enabled else None
 
     def _compute_cache_key(self, source: str, ref: str | None = None) -> str:
-        """Compute the canonical cache key for a source."""
         is_git = _is_git_url(source)
         return (f"{source}@{ref}" if ref else source) if is_git else str(Path(source).resolve())
 
@@ -144,23 +139,26 @@ class _IndexCache:
         self._tasks.pop(self._compute_cache_key(source), None)
 
     async def start_watcher(self, path: str) -> None:
-        """Start a background task that re-indexes the path whenever files change."""
         self._watcher_task = asyncio.create_task(self._watch_loop(path))
 
     async def _watch_loop(self, path: str) -> None:
-        """Watch the given path for changes and evict the cache entry on changes."""
-        try:
-            async for _ in watchfiles.awatch(path):
-                self.evict(path)
-                try:
-                    await self.get(path)
-                except Exception:
-                    logger.warning("Failed to rebuild index for %r after file change", path, exc_info=True)
-        except Exception:
-            pass
+        from semble.index.index import SembleIndex
 
-    async def get(self, source: str, ref: str | None = None) -> SembleIndex:
-        """Return an index for the requested source, building and caching it on first access."""
+        idx = await self.get(path)
+        try:
+            monitor = FileMonitor(Path(path), idx, self._disk_cache, self._config)
+            monitor.initialize_hashes()
+            async for _ in watchfiles.awatch(path):
+                import asyncio as _aio
+
+                await _aio.sleep(self._config.monitor.debounce_ms / 1000)
+                await monitor._on_change()
+        except Exception:
+            logger.warning("Watcher failed for %r", path, exc_info=True)
+
+    async def get(self, source: str, ref: str | None = None) -> "SembleIndex":
+        from semble.index.index import SembleIndex
+
         cache_key = self._compute_cache_key(source, ref)
 
         if cache_key in self._tasks:
@@ -176,12 +174,17 @@ class _IndexCache:
                         ref=ref,
                         model=self._model,
                         include_text_files=self._include_text_files,
+                        config=self._config,
                     )
                 )
             else:
                 self._tasks[cache_key] = asyncio.create_task(
                     asyncio.to_thread(
-                        SembleIndex.from_path, cache_key, model=self._model, include_text_files=self._include_text_files
+                        SembleIndex.from_path,
+                        source,
+                        model=self._model,
+                        include_text_files=self._include_text_files,
+                        config=self._config,
                     )
                 )
         task = self._tasks[cache_key]
@@ -192,7 +195,6 @@ class _IndexCache:
                 self.evict(source)
             raise
         except Exception:
-            # Only evict if this task hasn't already been replaced by evict()+get().
             if self._tasks.get(cache_key) is task:
                 self.evict(source)
             raise

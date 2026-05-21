@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class EmbeddingConfig(BaseModel):
+    backend: Literal["model2vec", "openai_compat"] = "model2vec"
+    model: str = "minishlab/potion-code-16M"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str | None = None
+    openai_model: str = "text-embedding-3-small"
+    openai_dim: int = 1536
+    batch_size: int = 512
+    max_retries: int = 3
+    max_concurrent: int = 10
+    max_context_tokens: int = 8192
+
+
+class VectorStoreConfig(BaseModel):
+    backend: Literal["numpy", "faiss"] = "numpy"
+    use_gpu: bool = False
+    index_type: Literal["flat", "ivf"] = "flat"
+    metric: Literal["ip", "l2"] = "ip"
+    ivf_nlist: int = 100
+
+
+class RerankerConfig(BaseModel):
+    backend: Literal["rules", "cross_encoder", "hybrid"] = "rules"
+    model: str | None = "BAAI/bge-reranker-v2-m3"
+    coarse_multiplier: int = 5
+
+
+class CacheConfig(BaseModel):
+    enabled: bool = True
+    dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "cache")
+
+
+class MonitorConfig(BaseModel):
+    enabled: bool = True
+    debounce_ms: int = 500
+
+
+class SembleConfig(BaseModel):
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+
+def _substitute_env_vars(value: str) -> str:
+    def _replacer(match: re.Match[str]) -> str:
+        var_name = match.group(1)
+        default_value = match.group(2)
+        env_value = os.environ.get(var_name)
+        if env_value is not None:
+            return env_value
+        if default_value is not None:
+            return default_value
+        return match.group(0)
+
+    return _ENV_VAR_RE.sub(_replacer, value)
+
+
+def _process_config_values(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _process_config_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_process_config_values(item) for item in obj]
+    if isinstance(obj, str):
+        return _substitute_env_vars(obj)
+    return obj
+
+
+def _find_default_config() -> Path | None:
+    candidates = [
+        Path("semble.yaml"),
+        Path("semble.yml"),
+        Path("semble.json"),
+        Path.home() / ".config" / "semble" / "config.yaml",
+        Path.home() / ".config" / "semble" / "config.yml",
+        Path.home() / ".config" / "semble" / "config.json",
+        Path.home() / ".semble" / "config.yaml",
+        Path.home() / ".semble" / "config.yml",
+        Path.home() / ".semble" / "config.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def load_config(path: str | Path | None = None) -> SembleConfig:
+    if path is None:
+        env_path = os.environ.get("SEMBLE_CONFIG")
+        if env_path:
+            path = env_path
+        else:
+            found = _find_default_config()
+            if found is None:
+                return SembleConfig()
+            path = found
+
+    path = Path(path)
+    if not path.exists():
+        return SembleConfig()
+
+    raw: dict[str, Any]
+    if path.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML config. Install with: pip install pyyaml")
+        with open(path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    elif path.suffix == ".json":
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    else:
+        raise ValueError(f"Unsupported config file format: {path.suffix}")
+
+    raw = _process_config_values(raw)
+    return SembleConfig(**raw)

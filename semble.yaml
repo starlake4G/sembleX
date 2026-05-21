@@ -1,0 +1,25 @@
+embedding:
+  backend: openai_compat
+  openai_base_url: http://100.88.1.2:8000/v1
+  openai_api_key: sk-test
+  openai_model: Qwen/Qwen3-VL-Embedding-2B
+  openai_dim: 2048
+  batch_size: 64
+  max_concurrent: 10
+  max_context_tokens: 32768
+
+vector_store:
+  backend: faiss
+  use_gpu: false
+  index_type: flat
+  metric: ip
+
+reranker:
+  backend: rules
+
+cache:
+  enabled: true
+
+monitor:
+  enabled: true
+  debounce_ms: 500

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import sys
 from enum import Enum
 from importlib.resources import files
@@ -8,9 +9,12 @@ from pathlib import Path
 
 from model2vec.utils import get_package_extras
 
+from semble.config import SembleConfig, load_config
 from semble.index import SembleIndex
 from semble.stats import format_savings_report
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
+
+logger = logging.getLogger(__name__)
 
 
 class Agent(str, Enum):
@@ -27,13 +31,11 @@ _CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "init", "savings", "-h
 
 
 def _agent_path(agent: Agent) -> Path:
-    """Return the project-relative path where the semble sub-agent file should be written."""
     base_dir = ".github" if agent is Agent.COPILOT else f".{agent.value}"
     return Path(base_dir) / "agents" / "semble-search.md"
 
 
 def main() -> None:
-    """Entry point for the semble command-line tool."""
     if len(sys.argv) > 1 and sys.argv[1] in _CLI_DISPATCH_ARGS:
         _cli_main()
     else:
@@ -57,17 +59,18 @@ def _mcp_main() -> None:
         action="store_true",
         help="Also index non-code text files (.md, .yaml, .json, etc.).",
     )
+    parser.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
     args = parser.parse_args()
     if any(find_spec(dep) is None for dep in get_package_extras("semble", "mcp")):
         print("MCP dependencies are not installed. Run: pip install 'semble[mcp]'", file=sys.stderr)
         raise SystemExit(1)
     from semble.mcp import serve
 
-    asyncio.run(serve(args.path, ref=args.ref, include_text_files=args.include_text_files))
+    cfg = load_config(args.config)
+    asyncio.run(serve(args.path, ref=args.ref, include_text_files=args.include_text_files, config=cfg))
 
 
 def _run_init(*, agent: Agent = _DEFAULT_AGENT, force: bool = False) -> None:
-    """Write the semble sub-agent file for the given coding agent into the current project."""
     dest = _agent_path(agent)
     if dest.exists() and not force:
         print(f"{dest} already exists. Run with --force to overwrite.", file=sys.stderr)
@@ -79,6 +82,11 @@ def _run_init(*, agent: Agent = _DEFAULT_AGENT, force: bool = False) -> None:
 
 
 def _cli_main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=sys.stderr,
+    )
     parser = argparse.ArgumentParser(prog="semble")
     sub = parser.add_subparsers(dest="command")
 
@@ -91,6 +99,7 @@ def _cli_main() -> None:
         action="store_true",
         help="Also index non-code text files (.md, .yaml, .json, etc.).",
     )
+    search_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
 
     related_p = sub.add_parser("find-related", help="Find code similar to a specific location.")
     related_p.add_argument("file_path", help="File path as shown in search results.")
@@ -102,6 +111,7 @@ def _cli_main() -> None:
         action="store_true",
         help="Also index non-code text files (.md, .yaml, .json, etc.).",
     )
+    related_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
 
     init_p = sub.add_parser("init", help="Write a semble sub-agent file for your coding agent.")
     init_p.add_argument(
@@ -126,11 +136,12 @@ def _cli_main() -> None:
         print(format_savings_report(verbose=args.verbose), end="")
         return
 
+    cfg = load_config(getattr(args, "config", None))
     include_text = args.include_text_files
     index = (
-        SembleIndex.from_git(args.path, include_text_files=include_text)
+        SembleIndex.from_git(args.path, include_text_files=include_text, config=cfg)
         if _is_git_url(args.path)
-        else SembleIndex.from_path(args.path, include_text_files=include_text)
+        else SembleIndex.from_path(args.path, include_text_files=include_text, config=cfg)
     )
 
     if args.command == "search":

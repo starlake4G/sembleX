@@ -70,7 +70,10 @@ def walk_files(root: Path, extensions: Sequence[str], ignore: Sequence[str] | No
 
 def _is_ignored(path: Path, specs: list[IgnoreSpec]) -> tuple[bool, bool]:
     """Check if a path is ignored by any of the provided ignore specs."""
-    is_dir = path.is_dir()
+    try:
+        is_dir = path.is_dir()
+    except OSError:
+        return True, False
     ignored = False
     found = False
     for ignore_spec in specs:
@@ -118,14 +121,15 @@ def _walk(
         ]
 
     for item in sorted(directory.iterdir()):
-        # Don't follow symlinks
-        if item.is_symlink():
+        try:
+            if item.is_symlink():
+                continue
+            is_ignored, found = _is_ignored(item, inherited_specs)
+            if is_ignored:
+                continue
+            if item.is_dir():
+                yield from _walk(item, inherited_specs, extensions)
+            elif item.is_file() and (found or item.suffix.lower() in extensions):
+                yield item
+        except OSError:
             continue
-        is_ignored, found = _is_ignored(item, inherited_specs)
-        if is_ignored:
-            continue
-
-        if item.is_dir():
-            yield from _walk(item, inherited_specs, extensions)
-        elif item.is_file() and (found or item.suffix.lower() in extensions):
-            yield item
