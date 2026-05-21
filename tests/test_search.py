@@ -119,7 +119,76 @@ def test_search_hybrid(
     sp = Bm25sSparseIndex()
     sp.build(pair, pair_ids)
 
+<<<<<<< HEAD
     deduped = search("helper", mock_model, vs, sp, pair, pair_by_id, top_k=5, namespace=LOCAL_NAMESPACE)
     locations = {r.chunk.file_path for r in deduped}
     assert "module_a.py" in locations
     assert "module_b.py" in locations
+=======
+    deduped = search("helper", mock_model, sem_index, bm25_index, all_chunks, top_k=5)
+    result_locations = {r.chunk.file_path for r in deduped}
+    assert "module_a.py" in result_locations
+    assert "module_b.py" in result_locations
+
+
+@pytest.mark.parametrize(
+    ("search_fn", "query", "top_k"),
+    [
+        (lambda q, m, s, b, c, k: _search_bm25(q, b, c, k, selector=None), "authenticate", 3),
+        (lambda q, m, s, b, c, k: _search_semantic(q, m, s, c, k, selector=None), "query", 4),
+        (lambda q, m, s, b, c, k: search(q, m, s, b, c, k), "login", 4),
+    ],
+)
+def test_search_source_labels(
+    search_fn: Any,
+    query: str,
+    top_k: int,
+    chunks: list[Chunk],
+    semantic: SelectableBasicBackend,
+    bm25: bm25s.BM25,
+    mock_model: Any,
+) -> None:
+    """Each result carries a source label matching the search mode used."""
+    results = search_fn(query, mock_model, semantic, bm25, chunks, top_k)
+    assert len(results) > 0
+
+
+def test_sort_top_k() -> None:
+    """_sort_top_k returns the same indices as np.argsort(-x)[:top_k]."""
+    gen = np.random.default_rng()
+    x = gen.standard_normal(size=(10000,))
+    top_k = 100
+    indices = _sort_top_k(x, top_k)
+    assert np.all(indices == np.argsort(-x)[:top_k])
+
+
+@pytest.mark.parametrize(
+    ("model_path", "expected_call_arg"),
+    [
+        (None, "minishlab/potion-code-16M"),  # default model
+        ("some/custom/model", "some/custom/model"),  # explicit path forwarded
+    ],
+)
+def test_load_model(model_path: str | None, expected_call_arg: str) -> None:
+    """load_model calls from_pretrained with default or custom model path."""
+    fake_model = MagicMock(spec=Encoder)
+    with patch("semble.index.dense.StaticModel.from_pretrained", return_value=fake_model) as mock_fp:
+        result = load_model(model_path)
+    mock_fp.assert_called_once_with(expected_call_arg, force_download=False)
+    assert result is fake_model
+
+
+def test_embed_chunks_empty_returns_empty_array(mock_model: Any) -> None:
+    """embed_chunks with an empty list returns a (0, 256) float32 array."""
+    result = embed_chunks(mock_model, [])
+    assert result.shape == (0, 256)
+    assert result.dtype == np.float32
+
+
+def test_selectable_basic_backend_rejects_k_below_one(
+    semantic: SelectableBasicBackend, embeddings: npt.NDArray[np.float32]
+) -> None:
+    """SelectableBasicBackend.query guards against k < 1."""
+    with pytest.raises(ValueError, match="k should be >= 1"):
+        semantic.query(embeddings[:1], k=0)
+>>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e

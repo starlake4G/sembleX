@@ -8,6 +8,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
+<<<<<<< HEAD
+=======
+[options]
+exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer-span = "P1W"
+
+>>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
 [[package]]
 name = "annotated-doc"
 version = "0.0.4"
@@ -3237,7 +3244,7 @@ requires-dist = [
     { name = "sentence-transformers", marker = "extra == 'benchmark'", specifier = ">=3.0" },
     { name = "sentence-transformers", marker = "extra == 'reranker'", specifier = ">=3.0" },
     { name = "tiktoken", marker = "extra == 'benchmark'", specifier = ">=0.7" },
-    { name = "tree-sitter", specifier = ">=0.25" },
+    { name = "tree-sitter", specifier = ">=0.25,<0.26" },
     { name = "tree-sitter-language-pack", specifier = ">=1.0,!=1.6.3,<1.8.0" },
     { name = "vicinity", specifier = ">=0.4.4" },
     { name = "watchfiles", marker = "extra == 'mcp'", specifier = ">=0.21" },

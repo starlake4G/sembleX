@@ -12,8 +12,6 @@ from tests.conftest import make_chunk
 
 _CLAUDE_FILE_PATH = _agent_path(Agent.CLAUDE)
 
-_CLAUDE_AGENT_FILE = files("semble").joinpath("agents/semble-search.md").read_text(encoding="utf-8")
-
 
 @pytest.mark.parametrize(
     "argv",
@@ -94,6 +92,7 @@ def test_cli_find_related(
         assert expected_stderr in captured.err
 
 
+<<<<<<< HEAD
 def test_cli_remote_search(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """Remote mode sends search to the remote client instead of building a local index."""
     cfg = SembleConfig(index=IndexConfig(backend="remote"))
@@ -140,12 +139,20 @@ def test_cli_remote_find_related(monkeypatch: pytest.MonkeyPatch, capsys: pytest
 
 def test_init_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """_run_init writes the agent file and prints its path."""
+=======
+@pytest.mark.parametrize("agent", list(Agent))
+def test_init_creates_file(
+    agent: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_run_init writes the correct agent file for every supported agent."""
+>>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
     monkeypatch.chdir(tmp_path)
-    _run_init()
-    dest = tmp_path / _CLAUDE_FILE_PATH
+    _run_init(agent=agent)
+    dest = tmp_path / _agent_path(agent)
+    expected = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
     assert dest.exists()
-    assert dest.read_text(encoding="utf-8") == _CLAUDE_AGENT_FILE
-    assert str(_CLAUDE_FILE_PATH) in capsys.readouterr().out
+    assert dest.read_text(encoding="utf-8") == expected
+    assert str(_agent_path(agent)) in capsys.readouterr().out
 
 
 def test_init_refuses_overwrite_without_force(
@@ -167,7 +174,7 @@ def test_init_overwrites_with_force(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text("old content", encoding="utf-8")
     _run_init(force=True)
-    assert dest.read_text(encoding="utf-8") == _CLAUDE_AGENT_FILE
+    assert dest.read_text(encoding="utf-8") == files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8")
 
 
 def test_init_via_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -240,7 +247,7 @@ def test_mcp_main_exits_with_message_when_extras_missing(
 
 def test_agent_file_tools_are_bash_only() -> None:
     """The agent file must list only Bash and Read — no MCP tools that require schema loading."""
-    frontmatter = _CLAUDE_AGENT_FILE.split("---")[1]
+    frontmatter = files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8").split("---")[1]
     tools_line = next(line for line in frontmatter.splitlines() if line.startswith("tools:"))
     tools = [t.strip() for t in tools_line.removeprefix("tools:").split(",")]
     assert set(tools) == {"Bash", "Read"}, f"Unexpected tools in agent file: {tools}"
