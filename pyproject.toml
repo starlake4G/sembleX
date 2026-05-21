@@ -56,6 +56,11 @@ reranker = [
 yaml = [
     "pyyaml>=6.0",
 ]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pymilvus>=2.4",
+]
 benchmark = [
     "sentence-transformers>=3.0",
     "numpy>=1.24.0",
@@ -65,7 +70,7 @@ benchmark = [
     "openai>=1.50",
 ]
 all = [
-    "semble[mcp,openai,faiss,reranker,yaml]",
+    "semble[mcp,openai,faiss,reranker,yaml,server]",
 ]
 dev = [
     "pytest>=8.0",
@@ -76,6 +81,7 @@ dev = [
     "pre-commit>=3.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
+    "tiktoken>=0.7",
 ]
 
 [project.urls]

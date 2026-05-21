@@ -8,8 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import numpy as np
-
+from semble.backends.sparse import Bm25sSparseIndex
 from semble.backends.vector_store import create_vector_store
 from semble.cache.hash_tracker import HashTracker
 from semble.config import SembleConfig
@@ -17,10 +16,34 @@ from semble.index.files import get_extensions
 from semble.types import Chunk
 
 if TYPE_CHECKING:
-    from semble.interfaces import VectorStore
     from semble.index.index import SembleIndex
+    from semble.interfaces import SparseIndex, VectorStore
 
 logger = logging.getLogger(__name__)
+
+_CHUNKS_JSONL = "chunks.jsonl"
+
+
+def _chunk_to_dict(chunk: Chunk, chunk_id: str) -> dict[str, object]:
+    return {
+        "chunk_id": chunk_id,
+        "content": chunk.content,
+        "file_path": chunk.file_path,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "language": chunk.language,
+    }
+
+
+def _chunk_from_dict(data: dict[str, object]) -> tuple[Chunk, str]:
+    chunk = Chunk(
+        content=str(data["content"]),
+        file_path=str(data["file_path"]),
+        start_line=int(data["start_line"]),
+        end_line=int(data["end_line"]),
+        language=data.get("language") if isinstance(data.get("language"), str) else None,
+    )
+    return chunk, str(data["chunk_id"])
 
 
 class CacheManager:
@@ -49,7 +72,12 @@ class CacheManager:
         if len(self._in_memory) > self._max_cache:
             self._in_memory.popitem(last=False)
 
-    def is_disk_valid(self, source: str) -> bool:
+    def is_disk_valid(
+        self,
+        source: str,
+        current_hashes: dict[str, str] | None = None,
+        extensions: frozenset[str] | set[str] | None = None,
+    ) -> bool:
         cache_path = self._cache_path(source)
         hash_file = cache_path / "file_hashes.json"
         if not hash_file.exists():
@@ -57,45 +85,52 @@ class CacheManager:
 
         root = Path(source).resolve() if Path(source).exists() else None
         if root is None:
+            # git URL caches expire only when explicitly invalidated by deletion.
             return True
 
         try:
             saved = json.loads(hash_file.read_text())
-            extensions = get_extensions(False, None)
-            current = HashTracker.compute_hashes(root, frozenset(extensions))
+            current = current_hashes
+            if current is None:
+                current_extensions = extensions or frozenset(get_extensions(False, None))
+                current = HashTracker.compute_hashes(root, frozenset(current_extensions))
             return saved == current
         except (OSError, json.JSONDecodeError):
             return False
 
-    def load_from_disk(self, source: str) -> tuple[list[Chunk], "VectorStore", object] | None:
+    def _load_chunks(self, cache_path: Path) -> tuple[list[Chunk], list[str]]:
+        chunks: list[Chunk] = []
+        chunk_ids: list[str] = []
+        with (cache_path / _CHUNKS_JSONL).open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                chunk, cid = _chunk_from_dict(json.loads(line))
+                chunks.append(chunk)
+                chunk_ids.append(cid)
+        return chunks, chunk_ids
+
+    def load_from_disk(
+        self, source: str
+    ) -> tuple[list[Chunk], list[str], "VectorStore", "SparseIndex"] | None:
         cache_path = self._cache_path(source)
         if not (cache_path / "meta.json").exists():
             return None
 
         try:
             meta = json.loads((cache_path / "meta.json").read_text())
-            chunks_data = json.loads((cache_path / "chunks.json").read_text())
-            chunks = [
-                Chunk(
-                    content=c["content"],
-                    file_path=c["file_path"],
-                    start_line=c["start_line"],
-                    end_line=c["end_line"],
-                    language=c.get("language"),
-                )
-                for c in chunks_data
-            ]
+            chunks, chunk_ids = self._load_chunks(cache_path)
 
             dim = meta.get("embedding_dim", 256)
             vs = create_vector_store(self._config.vector_store, dim)
             vs.load(cache_path / "vectors")
 
-            import bm25s
+            sparse = Bm25sSparseIndex()
+            sparse.load(cache_path / "sparse")
 
-            bm25_index = bm25s.BM25.load(str(cache_path / "bm25"), load_corpus=True)
-
-            return chunks, vs, bm25_index
-        except Exception as e:
+            return chunks, chunk_ids, vs, sparse
+        except Exception as e:  # noqa: BLE001 — cache is best-effort
             logger.warning("Failed to load cache for %s: %s", source, e)
             return None
 
@@ -119,23 +154,14 @@ class CacheManager:
             (cache_path / "meta.json").write_text(json.dumps(meta, indent=2))
 
             index._semantic_index.save(cache_path / "vectors")
+            index._sparse_index.save(cache_path / "sparse")
 
-            chunks_data = []
-            for c in index.chunks:
-                chunks_data.append(
-                    {
-                        "content": c.content,
-                        "file_path": c.file_path,
-                        "start_line": c.start_line,
-                        "end_line": c.end_line,
-                        "language": c.language,
-                    }
-                )
-            (cache_path / "chunks.json").write_text(json.dumps(chunks_data))
-
-            index._bm25_index.save(str(cache_path / "bm25"))
+            with (cache_path / _CHUNKS_JSONL).open("w", encoding="utf-8") as f:
+                for chunk, cid in zip(index.chunks, index.chunk_ids):
+                    f.write(json.dumps(_chunk_to_dict(chunk, cid), separators=(",", ":")))
+                    f.write("\n")
 
             (cache_path / "file_hashes.json").write_text(json.dumps(file_hashes))
             logger.info("Saved cache for %s (%d chunks)", source, len(index.chunks))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — cache is best-effort
             logger.error("Failed to save cache for %s: %s", source, e)

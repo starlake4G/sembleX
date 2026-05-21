@@ -13,6 +13,7 @@ class RulesReranker(Reranker):
         top_k: int,
         *,
         penalise_paths: bool = True,
+        coarse_k: int | None = None,  # noqa: ARG002 — accepted for interface symmetry
     ) -> list[tuple[Chunk, float]]:
         if not combined_scores:
             return []

@@ -5,7 +5,11 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _expand_path(value: Path | str) -> Path:
+    return Path(value).expanduser()
 
 
 class EmbeddingConfig(BaseModel):
@@ -39,18 +43,75 @@ class CacheConfig(BaseModel):
     enabled: bool = True
     dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "cache")
 
+    @field_validator("dir", mode="before")
+    @classmethod
+    def _expand_dir(cls, value: object) -> object:
+        return _expand_path(value) if isinstance(value, (str, Path)) else value
+
 
 class MonitorConfig(BaseModel):
     enabled: bool = True
     debounce_ms: int = 500
 
 
+class IndexingConfig(BaseModel):
+    """Settings that govern how files become chunks/embeddings.
+
+    Used by both the local index path and the remote server, so they cannot live
+    inside ``ServerConfig``.
+    """
+
+    max_file_bytes: int = 1_000_000
+    embed_batch_size: int = 512
+
+
+class IndexConfig(BaseModel):
+    backend: Literal["local", "remote"] = "local"
+
+
+class RemoteConfig(BaseModel):
+    base_url: str = "http://127.0.0.1:8080"
+    api_key: str | None = None
+    timeout: float = 120.0
+
+
+class ServerConfig(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8080
+    api_key: str | None = None
+    work_dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "server")
+    clone_timeout: int = 300
+
+    @field_validator("work_dir", mode="before")
+    @classmethod
+    def _expand_work_dir(cls, value: object) -> object:
+        return _expand_path(value) if isinstance(value, (str, Path)) else value
+
+
+class MilvusConfig(BaseModel):
+    uri: str = "http://127.0.0.1:19530"
+    token: str | None = None
+    db_name: str | None = None
+    collection: str = "semble_chunks"
+    vector_field: str = "vector"
+    metric_type: Literal["COSINE", "IP", "L2"] = "COSINE"
+    index_type: str = "AUTOINDEX"
+    index_params: dict[str, Any] = Field(default_factory=dict)
+    search_params: dict[str, Any] = Field(default_factory=dict)
+    consistency_level: str = "Bounded"
+
+
 class SembleConfig(BaseModel):
+    index: IndexConfig = Field(default_factory=IndexConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     monitor: MonitorConfig = Field(default_factory=MonitorConfig)
+    indexing: IndexingConfig = Field(default_factory=IndexingConfig)
+    remote: RemoteConfig = Field(default_factory=RemoteConfig)
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    milvus: MilvusConfig = Field(default_factory=MilvusConfig)
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
@@ -99,6 +160,7 @@ def _find_default_config() -> Path | None:
 
 
 def load_config(path: str | Path | None = None) -> SembleConfig:
+    """Load a Semble configuration from disk or return defaults."""
     if path is None:
         env_path = os.environ.get("SEMBLE_CONFIG")
         if env_path:
@@ -118,7 +180,7 @@ def load_config(path: str | Path | None = None) -> SembleConfig:
         try:
             import yaml
         except ImportError:
-            raise ImportError("PyYAML is required for YAML config. Install with: pip install pyyaml")
+            raise ImportError("PyYAML is required for YAML config. Install with: pip install pyyaml") from None
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
     elif path.suffix == ".json":

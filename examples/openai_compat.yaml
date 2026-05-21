@@ -1,0 +1,63 @@
+# Example Semble configuration.
+#
+# Three sections worth noting:
+#   * `embedding`/`vector_store`/`reranker` apply to the **local** index path.
+#   * `remote` configures the MCP/CLI side that talks to a server.
+#   * `server` + `milvus` are read when you run `semble server`.
+#
+# Environment-variable substitution is supported: ${VAR} or ${VAR:-default}.
+
+index:
+  backend: local            # set to "remote" to make CLI/MCP call a Semble server
+
+embedding:
+  backend: openai_compat
+  openai_base_url: ${SEMBLE_EMBED_BASE_URL:-https://api.openai.com/v1}
+  openai_api_key: ${SEMBLE_EMBED_API_KEY:-}
+  openai_model: ${SEMBLE_EMBED_MODEL:-text-embedding-3-small}
+  openai_dim: 1536
+  batch_size: 64
+  max_concurrent: 10
+  max_context_tokens: 8192
+
+vector_store:
+  backend: faiss            # or numpy
+  use_gpu: false
+  index_type: flat
+  metric: ip
+
+reranker:
+  backend: rules            # or cross_encoder / hybrid
+
+cache:
+  enabled: true
+  dir: ~/.semble/cache
+
+monitor:
+  enabled: true
+  debounce_ms: 500
+
+indexing:
+  max_file_bytes: 1000000
+  embed_batch_size: 512
+
+# --- Remote (client side) --------------------------------------------------
+remote:
+  base_url: ${SEMBLE_REMOTE_URL:-http://127.0.0.1:8080}
+  api_key: ${SEMBLE_REMOTE_API_KEY:-}
+  timeout: 120
+
+# --- Server side -----------------------------------------------------------
+server:
+  host: 0.0.0.0
+  port: 8080
+  api_key: ${SEMBLE_SERVER_API_KEY:-}
+  work_dir: ~/.semble/server
+  clone_timeout: 300
+
+milvus:
+  uri: ${MILVUS_URI:-http://127.0.0.1:19530}
+  token: ${MILVUS_TOKEN:-}
+  collection: semble_chunks
+  metric_type: COSINE
+  index_type: AUTOINDEX

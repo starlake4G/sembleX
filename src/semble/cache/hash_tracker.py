@@ -18,7 +18,7 @@ class HashTracker:
     @staticmethod
     def compute_hashes(root: Path, extensions: frozenset[str] | set[str]) -> dict[str, str]:
         hashes: dict[str, str] = {}
-        for f in sorted(walk_files(root, list(extensions))):
+        for f in walk_files(root, list(extensions)):
             try:
                 rel = str(f.relative_to(root)).replace("\\", "/")
                 hashes[rel] = HashTracker.file_hash(f)

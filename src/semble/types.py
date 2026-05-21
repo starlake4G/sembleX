@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -43,6 +44,18 @@ class Chunk:
     def location(self) -> str:
         """File path and line range as a string."""
         return f"{self.file_path}:{self.start_line}-{self.end_line}"
+
+
+def chunk_id(chunk: "Chunk", namespace: str = "") -> str:
+    """Stable identifier for a chunk inside *namespace*.
+
+    Derived from path + line range + content hash so the same source chunk
+    always maps to the same id regardless of insertion order, and trivial
+    content edits invalidate the id.
+    """
+    content_digest = hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()[:16]
+    raw = f"{namespace}|{chunk.file_path}|{chunk.start_line}|{chunk.end_line}|{content_digest}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True, slots=True)

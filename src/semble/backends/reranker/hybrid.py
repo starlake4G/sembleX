@@ -28,14 +28,17 @@ class HybridReranker(Reranker):
         top_k: int,
         *,
         penalise_paths: bool = True,
+        coarse_k: int | None = None,
     ) -> list[tuple[Chunk, float]]:
         if not combined_scores:
             return []
 
-        coarse_k = top_k * self._coarse_multiplier
+        effective_coarse_k = coarse_k if coarse_k is not None else top_k * self._coarse_multiplier
         coarse = self._rules.rerank(
-            query, combined_scores, all_chunks, coarse_k, penalise_paths=penalise_paths
+            query, combined_scores, all_chunks, effective_coarse_k, penalise_paths=penalise_paths,
         )
 
         fine_input = {chunk: score for chunk, score in coarse}
-        return self._model.rerank(query, fine_input, all_chunks, top_k)
+        return self._model.rerank(
+            query, fine_input, all_chunks, top_k, coarse_k=effective_coarse_k,
+        )

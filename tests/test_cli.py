@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from semble.cli import Agent, _agent_path, _cli_main, _run_init, main
+from semble.config import IndexConfig, SembleConfig
 from semble.types import SearchResult
 from tests.conftest import make_chunk
 
@@ -91,6 +92,50 @@ def test_cli_find_related(
         assert fragment in captured.out
     if expected_stderr:
         assert expected_stderr in captured.err
+
+
+def test_cli_remote_search(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Remote mode sends search to the remote client instead of building a local index."""
+    cfg = SembleConfig(index=IndexConfig(backend="remote"))
+    client = MagicMock()
+    client.search.return_value = "remote search results"
+    monkeypatch.setattr(sys, "argv", ["semble", "search", "query", "/repo", "--top-k", "7"])
+
+    with (
+        patch("semble.cli.load_config", return_value=cfg),
+        patch("semble.cli.RemoteSembleClient.from_config", return_value=client),
+        patch("semble.cli.SembleIndex.from_path") as from_path,
+    ):
+        _cli_main()
+
+    from_path.assert_not_called()
+    client.search.assert_called_once_with("query", repo="/repo", top_k=7, include_text_files=False)
+    assert "remote search results" in capsys.readouterr().out
+
+
+def test_cli_remote_find_related(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Remote mode resolves find-related remotely; no local chunk lookup is needed."""
+    cfg = SembleConfig(index=IndexConfig(backend="remote"))
+    client = MagicMock()
+    client.find_related.return_value = "remote related results"
+    monkeypatch.setattr(sys, "argv", ["semble", "find-related", "src/a.py", "3", "/repo"])
+
+    with (
+        patch("semble.cli.load_config", return_value=cfg),
+        patch("semble.cli.RemoteSembleClient.from_config", return_value=client),
+        patch("semble.cli.SembleIndex.from_path") as from_path,
+    ):
+        _cli_main()
+
+    from_path.assert_not_called()
+    client.find_related.assert_called_once_with(
+        "src/a.py",
+        3,
+        repo="/repo",
+        top_k=5,
+        include_text_files=False,
+    )
+    assert "remote related results" in capsys.readouterr().out
 
 
 def test_init_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

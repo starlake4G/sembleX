@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import cast
 
 import numpy as np
-import numpy.typing as npt
 from huggingface_hub.utils.tqdm import disable_progress_bars
 from model2vec import StaticModel
 
-from semble.interfaces import EmbeddingProvider, EmbeddingMatrix
+from semble.interfaces import EmbeddingMatrix, EmbeddingProvider
 
 
 class Model2VecEmbedding(EmbeddingProvider):

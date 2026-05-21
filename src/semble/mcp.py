@@ -6,15 +6,16 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Annotated
 
-import watchfiles
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from semble.backends.embedding import create_embedding_provider
 from semble.cache.manager import CacheManager
 from semble.config import SembleConfig
+from semble.index.index import SembleIndex
 from semble.interfaces import EmbeddingProvider
 from semble.monitor import FileMonitor
+from semble.remote import RemoteSembleClient
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 
 logger = logging.getLogger(__name__)
@@ -28,11 +29,7 @@ _REPO_DESCRIPTION = (
 _CACHE_MAX_SIZE = 10
 
 
-async def _get_index(
-    repo: str | None,
-    default_source: str | None,
-    cache: _IndexCache,
-) -> "SembleIndex":
+def _resolve_source(repo: str | None, default_source: str | None) -> str:
     if repo is not None and _is_git_url(repo) and not repo.startswith(("https://", "http://")):
         raise ValueError(f"Only https://, http://, or local directory paths are accepted as `repo`. Got: {repo!r}")
     source = repo or default_source
@@ -41,6 +38,15 @@ async def _get_index(
             "No repo specified and no default index. "
             "Pass an https:// or http:// git URL or local directory path as `repo`."
         )
+    return source
+
+
+async def _get_index(
+    repo: str | None,
+    default_source: str | None,
+    cache: _IndexCache,
+) -> "SembleIndex":
+    source = _resolve_source(repo, default_source)
     try:
         return await cache.get(source)
     except Exception as exc:
@@ -48,6 +54,7 @@ async def _get_index(
 
 
 def create_server(cache: _IndexCache, default_source: str | None = None) -> FastMCP:
+    """Create the local-index MCP server."""
     server = FastMCP(
         "semble",
         instructions=(
@@ -102,15 +109,82 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
     return server
 
 
+def create_remote_server(
+    client: RemoteSembleClient,
+    default_source: str | None = None,
+    include_text_files: bool = False,
+) -> FastMCP:
+    """Create the remote-index MCP server."""
+    server = FastMCP(
+        "semble",
+        instructions=(
+            "Remote Semble code search. Call `search` to find relevant code; call `find_related` on a result "
+            "to discover similar code elsewhere. Local indexing, embeddings, and vector search run in the "
+            "remote service."
+        ),
+    )
+
+    @server.tool()
+    async def search(
+        query: Annotated[str, Field(description="Natural language or code query.")],
+        repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
+        top_k: Annotated[int, Field(description="Number of results to return.", ge=1)] = 5,
+    ) -> str:
+        try:
+            source = _resolve_source(repo, default_source)
+            return await asyncio.to_thread(
+                client.search,
+                query,
+                repo=source,
+                top_k=top_k,
+                include_text_files=include_text_files,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return str(exc)
+
+    @server.tool()
+    async def find_related(
+        file_path: Annotated[
+            str,
+            Field(description="Path to the file as stored in the index (use file_path from a search result)."),
+        ],
+        line: Annotated[int, Field(description="Line number (1-indexed).")],
+        repo: Annotated[str | None, Field(description=_REPO_DESCRIPTION)] = None,
+        top_k: Annotated[int, Field(description="Number of similar chunks to return.", ge=1)] = 5,
+    ) -> str:
+        try:
+            source = _resolve_source(repo, default_source)
+            return await asyncio.to_thread(
+                client.find_related,
+                file_path,
+                line,
+                repo=source,
+                top_k=top_k,
+                include_text_files=include_text_files,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return str(exc)
+
+    return server
+
+
 async def serve(
     path: str | None = None,
     ref: str | None = None,
     include_text_files: bool = False,
     config: SembleConfig | None = None,
 ) -> None:
-    from semble.index.index import SembleIndex
-
+    """Run the Semble MCP server."""
     cfg = config or SembleConfig()
+    if cfg.index.backend == "remote":
+        server = create_remote_server(
+            RemoteSembleClient.from_config(cfg.remote),
+            default_source=path,
+            include_text_files=include_text_files,
+        )
+        await server.run_stdio_async()
+        return
+
     model = await asyncio.to_thread(create_embedding_provider, cfg.embedding)
     cache = _IndexCache(model=model, config=cfg, include_text_files=include_text_files)
     if path:
@@ -123,13 +197,18 @@ async def serve(
 
 
 class _IndexCache:
-    def __init__(self, model: EmbeddingProvider, config: SembleConfig, include_text_files: bool = False) -> None:
+    def __init__(
+        self,
+        model: EmbeddingProvider,
+        config: SembleConfig | None = None,
+        include_text_files: bool = False,
+    ) -> None:
         self._model = model
-        self._config = config
+        self._config = config or SembleConfig()
         self._include_text_files = include_text_files
         self._tasks: OrderedDict[str, asyncio.Task] = OrderedDict()
         self._watcher_task: asyncio.Task | None = None
-        self._disk_cache = CacheManager(config.cache.dir, config) if config.cache.enabled else None
+        self._disk_cache = CacheManager(self._config.cache.dir, self._config) if self._config.cache.enabled else None
 
     def _compute_cache_key(self, source: str, ref: str | None = None) -> str:
         is_git = _is_git_url(source)
@@ -142,23 +221,15 @@ class _IndexCache:
         self._watcher_task = asyncio.create_task(self._watch_loop(path))
 
     async def _watch_loop(self, path: str) -> None:
-        from semble.index.index import SembleIndex
-
-        idx = await self.get(path)
         try:
+            idx = await self.get(path)
             monitor = FileMonitor(Path(path), idx, self._disk_cache, self._config)
             monitor.initialize_hashes()
-            async for _ in watchfiles.awatch(path):
-                import asyncio as _aio
-
-                await _aio.sleep(self._config.monitor.debounce_ms / 1000)
-                await monitor._on_change()
+            await monitor.watch()
         except Exception:
             logger.warning("Watcher failed for %r", path, exc_info=True)
 
     async def get(self, source: str, ref: str | None = None) -> "SembleIndex":
-        from semble.index.index import SembleIndex
-
         cache_key = self._compute_cache_key(source, ref)
 
         if cache_key in self._tasks:

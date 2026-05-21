@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from semble.mcp import _CACHE_MAX_SIZE, _IndexCache, create_server, serve
+from semble.config import IndexConfig, SembleConfig
+from semble.mcp import _CACHE_MAX_SIZE, _IndexCache, create_remote_server, create_server, serve
 from semble.types import Chunk, Encoder, SearchResult
 from semble.utils import _format_results, _is_git_url, _resolve_chunk
 from tests.conftest import make_chunk
@@ -240,17 +241,58 @@ async def test_tool_output(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "args", "method"),
+    [
+        ("search", {"query": "foo", "repo": "/repo", "top_k": 3}, "search"),
+        ("find_related", {"file_path": "src/foo.py", "line": 4, "repo": "/repo"}, "find_related"),
+    ],
+)
+async def test_remote_server_routes_to_client(tool: str, args: dict[str, object], method: str) -> None:
+    """Remote MCP server calls the HTTP client instead of building an index."""
+    client = MagicMock()
+    getattr(client, method).return_value = "remote result"
+    server = create_remote_server(client, include_text_files=True)
+
+    result = await server.call_tool(tool, args)
+
+    assert "remote result" in _tool_text(result)
+    if method == "search":
+        client.search.assert_called_once_with("foo", repo="/repo", top_k=3, include_text_files=True)
+    else:
+        client.find_related.assert_called_once_with("src/foo.py", 4, repo="/repo", top_k=5, include_text_files=True)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("with_path", [True, False], ids=["pre_index", "no_path"])
 async def test_serve_runs_stdio(tmp_path: Path, with_path: bool) -> None:
     """serve() loads the model, runs stdio, and optionally pre-indexes when a path is given."""
     with (
-        patch("semble.mcp.load_model", return_value=MagicMock(spec=Encoder)),
+        patch("semble.mcp.create_embedding_provider", return_value=MagicMock(spec=Encoder)),
         patch("semble.mcp.SembleIndex.from_path", return_value=MagicMock()),
         patch.object(_IndexCache, "start_watcher", new_callable=AsyncMock),
         patch("mcp.server.fastmcp.FastMCP.run_stdio_async", new_callable=AsyncMock) as mock_run,
     ):
         await (serve(str(tmp_path)) if with_path else serve())
 
+    mock_run.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_serve_remote_skips_local_indexing(tmp_path: Path) -> None:
+    """Remote mode starts a remote MCP server without loading a local model or index."""
+    cfg = SembleConfig(index=IndexConfig(backend="remote"))
+    client = MagicMock()
+    with (
+        patch("semble.mcp.RemoteSembleClient.from_config", return_value=client),
+        patch("semble.mcp.create_embedding_provider") as create_model,
+        patch("semble.mcp.SembleIndex.from_path") as from_path,
+        patch("mcp.server.fastmcp.FastMCP.run_stdio_async", new_callable=AsyncMock) as mock_run,
+    ):
+        await serve(str(tmp_path), config=cfg)
+
+    create_model.assert_not_called()
+    from_path.assert_not_called()
     mock_run.assert_called_once()
 
 
@@ -312,7 +354,7 @@ async def test_watch_loop(cache: _IndexCache, tmp_path: Path) -> None:
         yield set()
         raise RuntimeError("watcher died")
 
-    with patch("semble.mcp.watchfiles.awatch", fake_awatch):
+    with patch("watchfiles.awatch", fake_awatch):
         with patch("semble.mcp.SembleIndex.from_path", side_effect=RuntimeError("build failed")):
             await cache.start_watcher(str(tmp_path))
             assert cache._watcher_task is not None

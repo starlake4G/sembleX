@@ -5,7 +5,8 @@ from unittest.mock import patch
 import pytest
 
 from semble import SembleIndex
-from semble.index.create import _MAX_FILE_BYTES, create_index_from_path
+from semble.config import IndexingConfig
+from semble.index.create import create_index_from_path
 from semble.types import Encoder
 from tests.conftest import make_chunk
 
@@ -24,7 +25,7 @@ def test_index_markdown_inclusion(
     mock_model: Encoder, tmp_project: Path, include_text_files: bool, md_in_results: bool
 ) -> None:
     """Markdown files are excluded by default and included when include_text_files=True."""
-    _, _, chunks = create_index_from_path(tmp_project, mock_model, include_text_files=include_text_files)
+    _, _, chunks, _ = create_index_from_path(tmp_project, mock_model, include_text_files=include_text_files)
     has_md = ".md" in {Path(c.file_path).suffix for c in chunks}
     assert has_md is md_in_results
 
@@ -36,10 +37,11 @@ def test_index_empty_returns_zero_chunks(mock_model: Encoder, tmp_path: Path) ->
 
 
 def test_oversized_file_is_skipped(mock_model: Encoder, tmp_path: Path) -> None:
-    """Files exceeding _MAX_FILE_BYTES are silently skipped during indexing."""
-    (tmp_path / "big.py").write_bytes(b"x" * (_MAX_FILE_BYTES + 1))
+    """Files exceeding indexing.max_file_bytes are silently skipped during indexing."""
+    indexing = IndexingConfig()
+    (tmp_path / "big.py").write_bytes(b"x" * (indexing.max_file_bytes + 1))
     with pytest.raises(ValueError):  # no indexable content remains
-        create_index_from_path(tmp_path, mock_model)
+        create_index_from_path(tmp_path, mock_model, indexing=indexing)
 
 
 def test_index_language_counts(indexed_index: SembleIndex) -> None:

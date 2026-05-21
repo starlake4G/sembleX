@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/zz/miniconda3/python -c \"import semble; print\\(semble.__file__\\)\")",
+      "Bash(/c/Users/zz/miniconda3/python -m pip show semble)",
+      "Bash(PYTHONPATH=src /c/Users/zz/miniconda3/python -m pytest tests/ -x -q --no-cov)",
+      "Bash(PYTHONPATH=src /c/Users/zz/miniconda3/python *)"
+    ]
+  }
+}

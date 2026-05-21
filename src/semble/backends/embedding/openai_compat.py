@@ -7,11 +7,22 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-import numpy.typing as npt
 
-from semble.interfaces import EmbeddingProvider, EmbeddingMatrix
+from semble.interfaces import EmbeddingFailure, EmbeddingMatrix, EmbeddingProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _token_counter(model: str) -> "callable[[str], int]":
+    try:
+        import tiktoken
+    except ImportError:
+        return lambda text: max(1, len(text) // 3)
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except (KeyError, ValueError):
+        enc = tiktoken.get_encoding("cl100k_base")
+    return lambda text: len(enc.encode(text, disallowed_special=()))
 
 
 class OpenAICompatEmbedding(EmbeddingProvider):
@@ -35,7 +46,7 @@ class OpenAICompatEmbedding(EmbeddingProvider):
         self._max_retries = max_retries
         self._max_concurrent = max_concurrent
         self._max_context_tokens = max_context_tokens
-        self._max_chars = max_context_tokens * 3
+        self._count_tokens = _token_counter(model)
         self._dim_lock = threading.Lock()
 
     @property
@@ -47,6 +58,7 @@ class OpenAICompatEmbedding(EmbeddingProvider):
         return self._dim
 
     def encode(self, texts: Sequence[str]) -> EmbeddingMatrix:
+        """Embed *texts*. Raises EmbeddingFailure if any text cannot be encoded."""
         if not texts:
             return np.empty((0, self._dim), dtype=np.float32)
 
@@ -64,7 +76,10 @@ class OpenAICompatEmbedding(EmbeddingProvider):
                 (i, text_list[i : i + self._batch_size])
                 for i in range(0, total, self._batch_size)
             ]
-            logger.info("Encoding %d texts in %d batches (batch_size=%d, workers=%d)...", total, len(batches), self._batch_size, self._max_concurrent)
+            logger.info(
+                "Encoding %d texts in %d batches (batch_size=%d, workers=%d)...",
+                total, len(batches), self._batch_size, self._max_concurrent,
+            )
             done_count = 0
             with ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
                 futures = {
@@ -75,38 +90,60 @@ class OpenAICompatEmbedding(EmbeddingProvider):
                     start_idx = futures[future]
                     try:
                         batch_result = future.result()
-                        for i, emb in enumerate(batch_result):
-                            all_embeddings[start_idx + i] = emb
-                    except Exception as e:
-                        logger.error("Failed to encode batch starting at %d: %s", start_idx, e)
+                    except Exception as exc:
+                        logger.error("Batch starting at %d raised: %s", start_idx, exc)
+                        batch_result = [None] * len(batches[start_idx // self._batch_size][1])
+                    for i, emb in enumerate(batch_result):
+                        all_embeddings[start_idx + i] = emb
                     done_count += 1
                     logger.info("Encoding progress: %d/%d batches done", done_count, len(batches))
 
-        failed_indices = [i for i, e in enumerate(all_embeddings) if e is None]
-        if len(failed_indices) == total:
-            raise RuntimeError("All embedding requests failed")
+        failed_indices = [i for i, emb in enumerate(all_embeddings) if emb is None]
+        successes = [emb for emb in all_embeddings if emb is not None]
 
-        actual_dim = next((len(e) for e in all_embeddings if e is not None), self._dim)
+        if not successes:
+            raise EmbeddingFailure(
+                f"All {total} embedding requests failed", failed_indices=failed_indices,
+            )
+
+        actual_dim = len(successes[0])
         if actual_dim != self._dim:
             with self._dim_lock:
                 self._dim = actual_dim
                 logger.info("Updated embedding dimension to %d", self._dim)
 
-        for i in failed_indices:
-            all_embeddings[i] = [0.0] * self._dim
+        if failed_indices:
+            partial = self._normalize(np.array(successes, dtype=np.float32))
+            logger.warning(
+                "Embedding partial failure: %d/%d texts failed; surfacing partial result",
+                len(failed_indices), total,
+            )
+            raise EmbeddingFailure(
+                f"{len(failed_indices)} of {total} embeddings failed",
+                failed_indices=failed_indices,
+                partial=partial,
+            )
 
-        arr = np.array(all_embeddings, dtype=np.float32)
+        full = np.array(all_embeddings, dtype=np.float32)
+        return self._normalize(full)
+
+    @staticmethod
+    def _normalize(arr: np.ndarray) -> EmbeddingMatrix:
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.where(norms > 1e-9, norms, 1.0)
-        arr = arr / norms
-        if failed_indices:
-            arr[failed_indices] = 0.0
-        return arr
+        return (arr / norms).astype(np.float32, copy=False)
 
     def _truncate(self, text: str) -> str:
-        if len(text) <= self._max_chars:
+        if self._count_tokens(text) <= self._max_context_tokens:
             return text
-        return text[: self._max_chars]
+        lo, hi = 1, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._count_tokens(text[:mid]) <= self._max_context_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo]
 
     def _encode_single(self, text: str) -> list[float] | None:
         text = self._truncate(text)
@@ -118,12 +155,12 @@ class OpenAICompatEmbedding(EmbeddingProvider):
                     encoding_format="float",
                 )
                 return response.data[0].embedding
-            except Exception as e:
+            except Exception as exc:  # noqa: BLE001 — provider-defined exception hierarchies vary
                 if attempt == self._max_retries - 1:
-                    logger.error("Single encode failed after %d retries: %s", self._max_retries, e)
+                    logger.error("Single encode failed after %d retries: %s", self._max_retries, exc)
                     return None
                 wait = 2**attempt
-                logger.warning("Retry %d/%d single: %s (waiting %ds)", attempt + 1, self._max_retries, e, wait)
+                logger.warning("Retry %d/%d single: %s (waiting %ds)", attempt + 1, self._max_retries, exc, wait)
                 time.sleep(wait)
         return None
 
@@ -138,14 +175,11 @@ class OpenAICompatEmbedding(EmbeddingProvider):
                 )
                 sorted_data = sorted(response.data, key=lambda x: x.index)
                 return [d.embedding for d in sorted_data]
-            except Exception as e:
+            except Exception as exc:  # noqa: BLE001
                 if attempt == self._max_retries - 1:
-                    logger.warning("Batch failed, falling back to single encoding: %s", e)
-                    results: list[list[float] | None] = []
-                    for t in truncated:
-                        results.append(self._encode_single(t))
-                    return results
+                    logger.warning("Batch failed, falling back to single encoding: %s", exc)
+                    return [self._encode_single(t) for t in truncated]
                 wait = 2**attempt
-                logger.warning("Retry %d/%d after error: %s (waiting %ds)", attempt + 1, self._max_retries, e, wait)
+                logger.warning("Retry %d/%d after error: %s (waiting %ds)", attempt + 1, self._max_retries, exc, wait)
                 time.sleep(wait)
         return [None] * len(texts)

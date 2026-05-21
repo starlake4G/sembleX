@@ -7,13 +7,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from semble.backends.vector_store import create_vector_store
 from semble.cache.hash_tracker import HashTracker
 from semble.chunking import chunk_source
 from semble.config import SembleConfig
-from semble.index.files import get_extensions
-from semble.index.sparse import enrich_for_bm25
-from semble.tokens import tokenize
+from semble.index.files import detect_language, get_extensions
+from semble.interfaces import LOCAL_NAMESPACE, EmbeddingFailure
+from semble.types import chunk_id
 
 if TYPE_CHECKING:
     from semble.cache.manager import CacheManager
@@ -23,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 class FileMonitor:
+    """Watches *root* and incrementally updates *index* on file changes."""
+
     def __init__(
         self,
         root: Path,
         index: "SembleIndex",
-        cache_manager: "CacheManager",
+        cache_manager: "CacheManager | None",
         config: SembleConfig,
     ) -> None:
         self._root = root
@@ -36,17 +37,10 @@ class FileMonitor:
         self._config = config
         self._hash_tracker = HashTracker()
         self._current_hashes: dict[str, str] = {}
-        self._file_to_chunks: dict[str, list[int]] = {}
 
     def initialize_hashes(self) -> None:
         extensions = get_extensions(False, None)
         self._current_hashes = self._hash_tracker.compute_hashes(self._root, frozenset(extensions))
-        self._rebuild_file_mapping()
-
-    def _rebuild_file_mapping(self) -> None:
-        self._file_to_chunks.clear()
-        for i, chunk in enumerate(self._index.chunks):
-            self._file_to_chunks.setdefault(chunk.file_path, []).append(i)
 
     async def watch(self) -> None:
         try:
@@ -68,35 +62,37 @@ class FileMonitor:
         if not affected_paths:
             return
 
-        affected_indices = sorted(
-            [i for p in affected_paths for i in self._file_to_chunks.get(p, [])],
-            reverse=True,
-        )
-        if not affected_indices:
+        affected_ids: list[str] = []
+        for fpath in affected_paths:
+            affected_ids.extend(self._index._file_mapping.get(fpath, []))
+
+        if not affected_ids and not changed:
             self._current_hashes = new_hashes
             return
 
+        old_count = len(self._index.chunks)
         logger.info(
             "File changes detected: %d added, %d removed, %d modified (%d chunks affected)",
-            len(added), len(removed), len(modified), len(affected_indices),
+            len(added), len(removed), len(modified), len(affected_ids),
         )
 
-        old_count = len(self._index.chunks)
-
-        keep_mask = np.ones(old_count, dtype=bool)
-        for i in affected_indices:
-            if 0 <= i < old_count:
-                keep_mask[i] = False
-
-        self._index._semantic_index.remove(affected_indices)
+        if affected_ids:
+            self._index._semantic_index.delete(LOCAL_NAMESPACE, affected_ids)
+            affected_set = set(affected_ids)
+            kept_pairs = [
+                (c, cid)
+                for c, cid in zip(self._index.chunks, self._index.chunk_ids)
+                if cid not in affected_set
+            ]
+            self._index.chunks = [c for c, _ in kept_pairs]
+            self._index.chunk_ids = [cid for _, cid in kept_pairs]
+            self._index._by_id = dict(zip(self._index.chunk_ids, self._index.chunks))
 
         new_chunks = []
-        from semble.index.files import detect_language
-
         for fpath in sorted(changed):
             full_path = self._root / fpath
             try:
-                if full_path.stat().st_size > 1_000_000:
+                if full_path.stat().st_size > self._config.indexing.max_file_bytes:
                     continue
                 source = full_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -104,28 +100,44 @@ class FileMonitor:
             language = detect_language(full_path)
             new_chunks.extend(chunk_source(source, fpath, language))
 
+        new_ids = [chunk_id(c, LOCAL_NAMESPACE) for c in new_chunks]
         if new_chunks:
-            new_embeddings = np.array(
-                self._index.model.encode([c.content for c in new_chunks]),
-                dtype=np.float32,
-            )
-            start_id = int(keep_mask.sum())
-            new_ids = list(range(start_id, start_id + len(new_chunks)))
-            self._index._semantic_index.add(new_ids, new_embeddings)
+            try:
+                new_embeddings = np.asarray(
+                    self._index.model.encode([c.content for c in new_chunks]),
+                    dtype=np.float32,
+                )
+                survivors = list(zip(new_chunks, new_ids))
+            except EmbeddingFailure as exc:
+                failed = set(exc.failed_indices)
+                survivors = [
+                    (c, cid) for i, (c, cid) in enumerate(zip(new_chunks, new_ids)) if i not in failed
+                ]
+                if exc.partial is None or not survivors:
+                    logger.warning("All %d new chunks failed to embed; skipping", len(new_chunks))
+                    new_chunks, new_ids = [], []
+                else:
+                    new_embeddings = np.asarray(exc.partial, dtype=np.float32)
+                    new_chunks = [c for c, _ in survivors]
+                    new_ids = [cid for _, cid in survivors]
+                    logger.warning(
+                        "Dropped %d/%d new chunks (embedding failed)",
+                        len(failed), len(survivors) + len(failed),
+                    )
 
-        kept_chunks = [c for c, keep in zip(self._index.chunks, keep_mask) if keep]
-        self._index.chunks = kept_chunks + new_chunks
+            if new_chunks:
+                self._index._semantic_index.add(LOCAL_NAMESPACE, new_ids, new_embeddings)
+                self._index.chunks = self._index.chunks + new_chunks
+                self._index.chunk_ids = self._index.chunk_ids + new_ids
+                self._index._by_id = dict(zip(self._index.chunk_ids, self._index.chunks))
 
-        import bm25s
+        # Rebuild BM25 — incremental updates are not supported by bm25s.
+        self._index._sparse_index.build(self._index.chunks, self._index.chunk_ids)
 
-        bm25_index = bm25s.BM25()
-        bm25_index.index(
-            [tokenize(enrich_for_bm25(c)) for c in self._index.chunks],
-            show_progress=False,
-        )
-        self._index._bm25_index = bm25_index
+        # Recompute file/language mappings now that chunks have shifted.
+        self._index._file_mapping, self._index._language_mapping = self._index._populate_mapping()
 
-        self._rebuild_file_mapping()
         self._current_hashes = new_hashes
-        self._cache_manager.save_to_disk(str(self._root), self._index, new_hashes)
+        if self._cache_manager is not None:
+            self._cache_manager.save_to_disk(str(self._root), self._index, new_hashes)
         logger.info("Index updated: %d chunks (was %d)", len(self._index.chunks), old_count)

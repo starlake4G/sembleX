@@ -1,16 +1,14 @@
 from typing import Any
-from unittest.mock import MagicMock, patch
 
-import bm25s
 import numpy as np
 import numpy.typing as npt
 import pytest
-from vicinity.backends.basic import BasicArgs
 
-from semble.index.dense import SelectableBasicBackend, embed_chunks, load_model
-from semble.search import _search_bm25, _search_semantic, _sort_top_k, search
-from semble.tokens import tokenize
-from semble.types import Chunk, Encoder
+from semble.backends.sparse import Bm25sSparseIndex
+from semble.backends.vector_store.numpy_store import NumpyVectorStore
+from semble.interfaces import LOCAL_NAMESPACE
+from semble.search import _search_bm25, _search_semantic, search
+from semble.types import Chunk, chunk_id
 from tests.conftest import make_chunk
 
 
@@ -26,136 +24,102 @@ def chunks() -> list[Chunk]:
 
 
 @pytest.fixture
+def chunk_ids(chunks: list[Chunk]) -> list[str]:
+    return [chunk_id(c, LOCAL_NAMESPACE) for c in chunks]
+
+
+@pytest.fixture
+def by_id(chunks: list[Chunk], chunk_ids: list[str]) -> dict[str, Chunk]:
+    return dict(zip(chunk_ids, chunks))
+
+
+@pytest.fixture
 def embeddings(chunks: list[Chunk]) -> npt.NDArray[np.float32]:
-    """Deterministic random unit-norm embeddings for the chunks fixture."""
     rng = np.random.default_rng(0)
     embs = rng.standard_normal((len(chunks), 256)).astype(np.float32)
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
-    normalized: npt.NDArray[np.float32] = embs / (norms + 1e-8)
-    return normalized
+    return (embs / (norms + 1e-8)).astype(np.float32)
 
 
 @pytest.fixture
-def bm25(chunks: list[Chunk]) -> bm25s.BM25:
-    """Pre-built BM25 index over the chunks fixture."""
-    index = bm25s.BM25()
-    index.index([tokenize(chunk.content) for chunk in chunks], show_progress=False)
-    return index
+def sparse(chunks: list[Chunk], chunk_ids: list[str]) -> Bm25sSparseIndex:
+    idx = Bm25sSparseIndex()
+    idx.build(chunks, chunk_ids)
+    return idx
 
 
 @pytest.fixture
-def semantic(embeddings: npt.NDArray[np.float32]) -> SelectableBasicBackend:
-    """Pre-built ANNS index over the chunks fixture."""
-    return SelectableBasicBackend(embeddings, BasicArgs())
+def semantic(
+    embeddings: npt.NDArray[np.float32], chunk_ids: list[str]
+) -> NumpyVectorStore:
+    vs = NumpyVectorStore(dim=embeddings.shape[1])
+    vs.add(LOCAL_NAMESPACE, chunk_ids, embeddings)
+    return vs
 
 
-def test_search_bm25(bm25: bm25s.BM25, chunks: list[Chunk]) -> None:
-    """search_bm25: returns most relevant chunk first; selector restricts to given indices."""
-    results = _search_bm25("authenticate token", bm25, chunks, top_k=4, selector=None)
-    assert len(results) > 0
+def test_sparse_returns_relevant(
+    sparse: Bm25sSparseIndex, by_id: dict[str, Chunk], chunks: list[Chunk]
+) -> None:
+    """BM25 returns most-relevant chunk first."""
+    results = _search_bm25("authenticate token", sparse, by_id, top_k=4, selector_ids=None)
+    assert results
     assert "authenticate" in results[0].chunk.content
 
-    selector = np.array([len(chunks) - 1], dtype=np.int_)
-    filtered = _search_bm25("format", bm25, chunks, top_k=4, selector=selector)
-    assert all(r.chunk is chunks[len(chunks) - 1] for r in filtered)
+
+def test_sparse_selector_restricts(
+    sparse: Bm25sSparseIndex, by_id: dict[str, Chunk], chunks: list[Chunk], chunk_ids: list[str]
+) -> None:
+    """selector_ids restricts BM25 results to the supplied chunk_ids."""
+    only = [chunk_ids[-1]]
+    results = _search_bm25("format", sparse, by_id, top_k=4, selector_ids=only)
+    assert all(r.chunk is chunks[-1] for r in results)
 
 
 @pytest.mark.parametrize("query", ["", "   ", "\n\n", "zzzznonexistentterm"])
-def test_bm25_returns_empty_for_no_match(bm25: bm25s.BM25, chunks: list[Chunk], query: str) -> None:
-    """Empty / whitespace-only / token-less queries return [] instead of crashing bm25s."""
-    assert _search_bm25(query, bm25, chunks, top_k=3, selector=None) == []
+def test_sparse_empty_for_no_match(sparse: Bm25sSparseIndex, by_id: dict[str, Chunk], query: str) -> None:
+    assert _search_bm25(query, sparse, by_id, top_k=3, selector_ids=None) == []
 
 
-def test_semantic_search(semantic: SelectableBasicBackend, chunks: list[Chunk], mock_model: Any) -> None:
-    """Semantic search returns results with scores in [-1, 1]."""
-    results = _search_semantic("login", mock_model, semantic, chunks, top_k=3, selector=None)
-    assert len(results) > 0
+def test_semantic_search(
+    semantic: NumpyVectorStore, by_id: dict[str, Chunk], mock_model: Any
+) -> None:
+    results = _search_semantic("login", mock_model, semantic, LOCAL_NAMESPACE, by_id, top_k=3, selector_ids=None)
+    assert results
     assert all(-1.0 <= r.score <= 1.0 for r in results)
 
 
 def test_search_hybrid(
-    chunks: list[Chunk], semantic: SelectableBasicBackend, bm25: bm25s.BM25, mock_model: Any
+    chunks: list[Chunk],
+    chunk_ids: list[str],
+    by_id: dict[str, Chunk],
+    semantic: NumpyVectorStore,
+    sparse: Bm25sSparseIndex,
+    mock_model: Any,
 ) -> None:
-    """search_hybrid: returns combined results; identical content in different files produces separate results."""
-    results = search("authenticate token", mock_model, semantic, bm25, chunks, top_k=3)
-    assert len(results) > 0
+    results = search(
+        "authenticate token", mock_model, semantic, sparse, chunks, by_id,
+        top_k=3, namespace=LOCAL_NAMESPACE,
+    )
+    assert results
 
+    # Identical content in different files should not be deduplicated.
     shared_content = "def helper():\n    pass"
-    chunk_a = make_chunk(shared_content, "module_a.py")
-    chunk_b = make_chunk(shared_content, "module_b.py")
-    all_chunks = [chunk_a, chunk_b]
+    a = make_chunk(shared_content, "module_a.py")
+    b = make_chunk(shared_content, "module_b.py")
+    pair = [a, b]
+    pair_ids = [chunk_id(c, LOCAL_NAMESPACE) for c in pair]
+    pair_by_id = dict(zip(pair_ids, pair))
 
     rng = np.random.default_rng(1)
     embs = rng.standard_normal((2, 256)).astype(np.float32)
     embs /= np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
 
-    sem_index = SelectableBasicBackend(embs, BasicArgs())
-    bm25_index = bm25s.BM25()
-    bm25_index.index([tokenize(c.content) for c in all_chunks], show_progress=False)
+    vs = NumpyVectorStore(dim=256)
+    vs.add(LOCAL_NAMESPACE, pair_ids, embs)
+    sp = Bm25sSparseIndex()
+    sp.build(pair, pair_ids)
 
-    deduped = search("helper", mock_model, sem_index, bm25_index, all_chunks, top_k=5)
-    result_locations = {r.chunk.file_path for r in deduped}
-    assert "module_a.py" in result_locations
-    assert "module_b.py" in result_locations
-
-
-@pytest.mark.parametrize(
-    ("search_fn", "query", "top_k"),
-    [
-        (lambda q, m, s, b, c, k: _search_bm25(q, b, c, k, selector=None), "authenticate", 3),
-        (lambda q, m, s, b, c, k: _search_semantic(q, m, s, c, k, selector=None), "query", 4),
-        (lambda q, m, s, b, c, k: search(q, m, s, b, c, k), "login", 4),
-    ],
-)
-def test_search_source_labels(
-    search_fn: Any,
-    query: str,
-    top_k: int,
-    chunks: list[Chunk],
-    semantic: SelectableBasicBackend,
-    bm25: bm25s.BM25,
-    mock_model: Any,
-) -> None:
-    """Each result carries a source label matching the search mode used."""
-    results = search_fn(query, mock_model, semantic, bm25, chunks, top_k)
-    assert len(results) > 0
-
-
-def test_sort_top_k() -> None:
-    """_sort_top_k returns the same indices as np.argsort(-x)[:top_k]."""
-    gen = np.random.default_rng()
-    x = gen.standard_normal(size=(10000,))
-    top_k = 100
-    indices = _sort_top_k(x, top_k)
-    assert np.all(indices == np.argsort(-x)[:top_k])
-
-
-@pytest.mark.parametrize(
-    ("model_path", "expected_call_arg"),
-    [
-        (None, "minishlab/potion-code-16M"),  # default model
-        ("some/custom/model", "some/custom/model"),  # explicit path forwarded
-    ],
-)
-def test_load_model(model_path: str | None, expected_call_arg: str) -> None:
-    """load_model calls from_pretrained with default or custom model path."""
-    fake_model = MagicMock(spec=Encoder)
-    with patch("semble.index.dense.StaticModel.from_pretrained", return_value=fake_model) as mock_fp:
-        result = load_model(model_path)
-    mock_fp.assert_called_once_with(expected_call_arg)
-    assert result is fake_model
-
-
-def test_embed_chunks_empty_returns_empty_array(mock_model: Any) -> None:
-    """embed_chunks with an empty list returns a (0, 256) float32 array."""
-    result = embed_chunks(mock_model, [])
-    assert result.shape == (0, 256)
-    assert result.dtype == np.float32
-
-
-def test_selectable_basic_backend_rejects_k_below_one(
-    semantic: SelectableBasicBackend, embeddings: npt.NDArray[np.float32]
-) -> None:
-    """SelectableBasicBackend.query guards against k < 1."""
-    with pytest.raises(ValueError, match="k should be >= 1"):
-        semantic.query(embeddings[:1], k=0)
+    deduped = search("helper", mock_model, vs, sp, pair, pair_by_id, top_k=5, namespace=LOCAL_NAMESPACE)
+    locations = {r.chunk.file_path for r in deduped}
+    assert "module_a.py" in locations
+    assert "module_b.py" in locations

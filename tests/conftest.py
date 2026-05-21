@@ -22,6 +22,12 @@ def make_chunk(content: str, file_path: str = "src/module.py") -> Chunk:
 
 
 @pytest.fixture
+def anyio_backend() -> str:
+    """Run async tests on asyncio; trio is not a test dependency."""
+    return "asyncio"
+
+
+@pytest.fixture
 def tmp_py_file(tmp_path: Path) -> Path:
     """A simple Python file with two functions."""
     code = textwrap.dedent(

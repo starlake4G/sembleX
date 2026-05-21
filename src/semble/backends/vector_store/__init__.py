@@ -3,6 +3,7 @@ from semble.interfaces import VectorStore
 
 
 def create_vector_store(config: VectorStoreConfig | None = None, dim: int = 256) -> VectorStore:
+    """Instantiate the local-side dense vector store described by *config*."""
     if config is None:
         from semble.config import SembleConfig
 

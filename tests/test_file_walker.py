@@ -154,11 +154,17 @@ def test_walk_files_skips_symlinks(tmp_path: Path) -> None:
     # A symlink to that directory from another location
     link_parent = tmp_path / "wrapper" / "src"
     link_parent.mkdir(parents=True)
-    (link_parent / "linked").symlink_to(real_dir)
+    try:
+        (link_parent / "linked").symlink_to(real_dir)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not permitted: {exc}")
 
     # A symlink to a single file
     _touch(tmp_path / "original.py")
-    (tmp_path / "link_to_original.py").symlink_to(tmp_path / "original.py")
+    try:
+        (tmp_path / "link_to_original.py").symlink_to(tmp_path / "original.py")
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not permitted: {exc}")
 
     found = {p.relative_to(tmp_path).as_posix() for p in walk_files(tmp_path, [".py"])}
 

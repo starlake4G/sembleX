@@ -21,12 +21,14 @@ class CrossEncoderReranker(Reranker):
         top_k: int,
         *,
         penalise_paths: bool = True,
+        coarse_k: int | None = None,
     ) -> list[tuple[Chunk, float]]:
         if not combined_scores:
             return []
 
         candidates = sorted(combined_scores.items(), key=lambda x: -x[1])
-        candidates = candidates[: top_k * 5]
+        if coarse_k is not None and coarse_k > 0:
+            candidates = candidates[:coarse_k]
 
         pairs = [(query, chunk.content) for chunk, _ in candidates]
         scores = self._model.predict(pairs)
