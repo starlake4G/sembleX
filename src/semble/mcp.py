@@ -109,7 +109,6 @@ def create_server(cache: _IndexCache, default_source: str | None = None) -> Fast
     return server
 
 
-<<<<<<< HEAD
 def create_remote_server(
     client: RemoteSembleClient,
     default_source: str | None = None,
@@ -192,11 +191,6 @@ async def serve(
         await cache.get(path, ref=ref)
         if not _is_git_url(path) and cfg.monitor.enabled:
             await cache.start_watcher(path)
-=======
-async def serve(path: str | None = None, ref: str | None = None, include_text_files: bool = False) -> None:
-    """Start an MCP stdio server, optionally pre-indexing a default source."""
-    cache = _IndexCache(include_text_files=include_text_files)
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
 
     async def _load_and_prewarm() -> None:
         """Pre-load the model and optionally pre-index the default source in parallel with starting the server."""
@@ -226,7 +220,6 @@ async def serve(path: str | None = None, ref: str | None = None, include_text_fi
 
 
 class _IndexCache:
-<<<<<<< HEAD
     def __init__(
         self,
         model: EmbeddingProvider,
@@ -235,17 +228,6 @@ class _IndexCache:
     ) -> None:
         self._model = model
         self._config = config or SembleConfig()
-=======
-    """Cache of indexed repos and local paths for the lifetime of the MCP server process."""
-
-    def __init__(self, model: Encoder | None = None, include_text_files: bool = False) -> None:
-        """Initialise an empty cache."""
-        self._model: Encoder | None = model
-        self._model_error: BaseException | None = None
-        self._model_ready = asyncio.Event()
-        if model is not None:
-            self._model_ready.set()
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
         self._include_text_files = include_text_files
         self._tasks: OrderedDict[str, asyncio.Task] = OrderedDict()
         self._watcher_task: asyncio.Task | None = None
@@ -281,7 +263,6 @@ class _IndexCache:
     async def get(self, source: str, ref: str | None = None) -> "SembleIndex":
         cache_key = self._compute_cache_key(source, ref)
 
-<<<<<<< HEAD
         if cache_key in self._tasks:
             self._tasks.move_to_end(cache_key)
         else:
@@ -306,32 +287,6 @@ class _IndexCache:
                         model=self._model,
                         include_text_files=self._include_text_files,
                         config=self._config,
-=======
-        if cache_key not in self._tasks:
-            model = await self._await_model()
-            # Re-check after the await: another caller may have populated the entry.
-            if cache_key not in self._tasks:
-                if len(self._tasks) >= _CACHE_MAX_SIZE:
-                    self._tasks.popitem(last=False)
-                if _is_git_url(source):
-                    self._tasks[cache_key] = asyncio.create_task(
-                        asyncio.to_thread(
-                            SembleIndex.from_git,
-                            source,
-                            ref=ref,
-                            model=model,
-                            include_text_files=self._include_text_files,
-                        )
-                    )
-                else:
-                    self._tasks[cache_key] = asyncio.create_task(
-                        asyncio.to_thread(
-                            SembleIndex.from_path,
-                            cache_key,
-                            model=model,
-                            include_text_files=self._include_text_files,
-                        )
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
                     )
         self._tasks.move_to_end(cache_key)
         task = self._tasks[cache_key]

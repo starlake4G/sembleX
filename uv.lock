@@ -8,13 +8,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-<<<<<<< HEAD
-=======
-[options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P1W"
-
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
 [[package]]
 name = "annotated-doc"
 version = "0.0.4"

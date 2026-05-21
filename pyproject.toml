@@ -3,8 +3,8 @@ requires = ["setuptools>=64", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "semble"
-description = "Fast and Accurate Code Search for Agents"
+name = "semblex"
+description = "SembleX — Extended code search for agents with pluggable backends and remote server"
 authors = [{name = "Thomas van Dongen", email = "thomas123@live.nl"}, { name = "Stéphan Tulkens", email = "stephantul@gmail.com"}]
 readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = ["version"]
@@ -31,14 +31,9 @@ dependencies = [
     "numpy>=1.24.0",
     "bm25s>=0.2.0",
     "pathspec>=0.12",
-<<<<<<< HEAD
     "tree-sitter>=0.25",
     "tree-sitter-language-pack>=1.0,<1.8.0,!=1.6.3",
     "pydantic>=2.0",
-=======
-    "tree-sitter>=0.25,<0.26",
-    "tree-sitter-language-pack>=1.0,<1.8.0,!=1.6.3"
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
 ]
 
 [project.optional-dependencies]

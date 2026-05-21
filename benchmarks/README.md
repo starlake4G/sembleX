@@ -1,6 +1,6 @@
 # Benchmarks
 
-Quality and speed benchmarks for `semble`.
+Quality and speed benchmarks for `semblex` (based on [Semble](https://github.com/MinishLab/semble)).
 
 - [Main results](#main-results)
 - [Token efficiency](#token-efficiency)
@@ -18,7 +18,7 @@ Quality and speed across all methods.
 | Method | NDCG@10 | Index | Query p50 |
 |---|---:|---:|---:|
 | CodeRankEmbed Hybrid | 0.862 | 57 s | 16 ms |
-| **semble** | **0.854** | **263 ms** | **1.5 ms** |
+| **semblex** | **0.854** | **263 ms** | **1.5 ms** |
 | CodeRankEmbed | 0.765 | 57 s | 16 ms |
 | ColGREP | 0.693 | 5.8 s | 124 ms |
 | BM25 | 0.673 | 263 ms | 0.02 ms |
@@ -30,13 +30,13 @@ Quality and speed across all methods.
 |:--:|:--:|
 | *Time to first result (index + query) vs NDCG@10* | *Query latency on a warm index vs NDCG@10* |
 
-The 137M-param CodeRankEmbed Hybrid wins NDCG@10 by 0.008. semble wins index time by 218x and query latency by 11x.
+The 137M-param CodeRankEmbed Hybrid wins NDCG@10 by 0.008. semblex wins index time by 218x and query latency by 11x.
 
 NDCG@10 is averaged across all queries. Speed numbers use one repo per language, CPU only: cold-start index time and warm query p50 (median across 5 consecutive runs).
 
 ## Token efficiency
 
-Coding agents (Claude Code, OpenCode, etc.) typically find code by running `grep` on keywords and reading the matched files. We model that workflow and compare it against semble's chunk retrieval across our full benchmark of 1251 queries.
+Coding agents (Claude Code, OpenCode, etc.) typically find code by running `grep` on keywords and reading the matched files. We model that workflow and compare it against semblex's chunk retrieval across our full benchmark of 1251 queries.
 
 ![Token efficiency: recall vs. retrieved tokens](../assets/images/token_efficiency.png)
 

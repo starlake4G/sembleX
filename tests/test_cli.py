@@ -92,7 +92,6 @@ def test_cli_find_related(
         assert expected_stderr in captured.err
 
 
-<<<<<<< HEAD
 def test_cli_remote_search(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """Remote mode sends search to the remote client instead of building a local index."""
     cfg = SembleConfig(index=IndexConfig(backend="remote"))
@@ -139,13 +138,6 @@ def test_cli_remote_find_related(monkeypatch: pytest.MonkeyPatch, capsys: pytest
 
 def test_init_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """_run_init writes the agent file and prints its path."""
-=======
-@pytest.mark.parametrize("agent", list(Agent))
-def test_init_creates_file(
-    agent: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """_run_init writes the correct agent file for every supported agent."""
->>>>>>> d36268329f6aefc4a9475746947b60730e0c0c6e
     monkeypatch.chdir(tmp_path)
     _run_init(agent=agent)
     dest = tmp_path / _agent_path(agent)
