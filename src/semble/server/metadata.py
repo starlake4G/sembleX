@@ -179,6 +179,11 @@ class MetadataStore:
         rows = self._conn.execute("select chunk_id from chunks where repo_id = ?", (repo_id,)).fetchall()
         return [str(row["chunk_id"]) for row in rows]
 
+    def total_chunk_count(self) -> int:
+        """Return the number of chunks across all indexed repos."""
+        row = self._conn.execute("select count(*) as n from chunks").fetchone()
+        return int(row["n"]) if row is not None else 0
+
     def repo_sources(self) -> dict[str, str]:
         """Return ``{repo_id: source}`` for all indexed repos."""
         rows = self._conn.execute("select repo_id, source from repos").fetchall()

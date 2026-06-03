@@ -24,6 +24,10 @@ class EmbeddingConfig(BaseModel):
     max_retries: int = 3
     max_concurrent: int = 10
     max_context_tokens: int = 8192
+    # Optional HF/modelscope id or local path of the serving model's tokenizer. When set
+    # (and `transformers` is installed), token counts match the server exactly so inputs
+    # are truncated precisely. Falls back to tiktoken / a heuristic when unset or unloadable.
+    tokenizer: str | None = None
 
 
 class RerankerConfig(BaseModel):

@@ -76,6 +76,16 @@ class GlobalIndex:
             try:
                 self._sparse.load(self._sparse_dir())
                 self._sparse_loaded_mtime = marker.stat().st_mtime
+                expected = self._metadata.total_chunk_count()
+                if self._sparse.doc_count != expected:
+                    logger.warning(
+                        "BM25 index has %d docs but metadata has %d chunks; rebuilding "
+                        "(likely an interrupted deferred-save batch)",
+                        self._sparse.doc_count,
+                        expected,
+                    )
+                    self._rebuild_sparse_from_metadata()
+                    return
                 logger.info("Loaded global BM25 index from %s", self._sparse_dir())
                 return
             except Exception:
@@ -125,8 +135,21 @@ class GlobalIndex:
         include_text_files: bool = False,
         force: bool = False,
         ref: str | None = None,
+        persist: bool = True,
     ) -> IndexOutcome:
-        """Index (or re-index with *force*) a repo into the global Milvus + BM25 + metadata stores."""
+        """Index (or re-index with *force*) a repo into the global Milvus + BM25 + metadata stores.
+
+        :param repo: Local path or git URL of the repository.
+        :param include_text_files: Also index non-code text files.
+        :param force: Rebuild even if the repo is already indexed.
+        :param ref: Branch or tag to check out (git URLs only).
+        :param persist: Write the global BM25 index to disk before returning. Set
+            ``False`` when indexing many repos in a loop and call :meth:`flush` once at
+            the end (and periodically) — saving the whole BM25 index per repo is O(total
+            chunks) and dominates the time between repos. Vector and SQLite stores are
+            always persisted regardless of this flag.
+        :returns: The outcome (repo id, chunk count, whether it was (re)indexed).
+        """
         repo_id = self._repo_id(repo)
         with self._lock:
             if not force and self._metadata.has_repo(repo_id):
@@ -142,11 +165,13 @@ class GlobalIndex:
 
             chunks, ids = self._index_chunks_streaming(repo_id, source_path, include_text_files)
             if not chunks:
-                self._save_sparse()
+                if persist:
+                    self._save_sparse()
                 raise ValueError(f"No supported files found under {source_path}.")
 
             self._sparse.add_documents(chunks, ids)
-            self._save_sparse()
+            if persist:
+                self._save_sparse()
 
             self._metadata.finish_repo_replace(
                 repo_id=repo_id,
@@ -162,6 +187,15 @@ class GlobalIndex:
             )
             self._refresh_repos()
             return IndexOutcome(repo_id, len(chunks), indexed=True)
+
+    def flush(self) -> None:
+        """Persist the in-memory global BM25 index to disk.
+
+        Call after a batch of ``index_repo(..., persist=False)`` calls to write the
+        accumulated index once instead of once per repo.
+        """
+        with self._lock:
+            self._save_sparse()
 
     # ------------------------------------------------------------------ search
 

@@ -159,6 +159,35 @@ def test_workspace_scope_resolves_subdirectory(index, tmp_path: Path) -> None:  
         index.search("authenticate", repo=str(tmp_path / "not_indexed"))
 
 
+def test_deferred_persist_defers_bm25_save_until_flush(index, tmp_path: Path) -> None:  # noqa: ANN001
+    repo_a = _make_repo(tmp_path / "src", "repo_a")
+    marker = index._sparse_marker()
+    before = marker.stat().st_mtime
+
+    index.index_repo(str(repo_a), persist=False)
+    # The repo's chunks are in memory and searchable, but the BM25 file is untouched.
+    assert index._sparse.doc_count >= 1
+    assert marker.stat().st_mtime == before
+
+    index.flush()
+    assert marker.stat().st_mtime > before
+
+
+def test_load_rebuilds_bm25_when_inconsistent_with_metadata(index, tmp_path: Path) -> None:  # noqa: ANN001
+    from semble.server.indexer import GlobalIndex
+
+    repo_a = _make_repo(tmp_path / "src", "repo_a")
+    # Index without persisting and without flushing: metadata (SQLite) has the chunks
+    # but the on-disk BM25 index does not — i.e. an interrupted deferred-save batch.
+    index.index_repo(str(repo_a), persist=False)
+    expected = index._metadata.total_chunk_count()
+    assert expected >= 1
+
+    # A fresh index over the same core dir must self-heal by rebuilding from metadata.
+    reopened = GlobalIndex(SembleConfig(core={"dir": str(tmp_path / "core")}))
+    assert reopened._sparse.doc_count == expected
+
+
 def test_status_reports_repos_and_chunks(index, tmp_path: Path) -> None:  # noqa: ANN001
     repo = _make_repo(tmp_path / "src", "solo")
     index.index_repo(str(repo))

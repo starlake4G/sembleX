@@ -128,7 +128,12 @@ def _run_index(args: argparse.Namespace, cfg: SembleConfig) -> None:
         print("Provide a <source> or use --all.", file=sys.stderr)
         sys.exit(1)
 
+    # Saving the global BM25 index is O(total chunks); doing it per repo dominates the
+    # time between repos. For multi-repo runs, defer the save and flush periodically.
+    flush_every = 25
+    defer = len(entries) > 1
     failures = 0
+    indexed_since_flush = 0
     for entry in entries:
         try:
             outcome = index.index_repo(
@@ -136,12 +141,20 @@ def _run_index(args: argparse.Namespace, cfg: SembleConfig) -> None:
                 include_text_files=entry.include_text_files or args.include_text_files,
                 force=force,
                 ref=entry.ref or args.ref,
+                persist=not defer,
             )
             state = "indexed" if outcome.indexed else "already indexed (use --force)"
             print(f"{entry.display_name}: {state}, {outcome.chunk_count} chunks")
+            if defer and outcome.indexed:
+                indexed_since_flush += 1
+                if indexed_since_flush >= flush_every:
+                    index.flush()
+                    indexed_since_flush = 0
         except Exception as exc:  # noqa: BLE001 — report per-repo and continue.
             failures += 1
             print(f"{entry.display_name}: FAILED — {exc}", file=sys.stderr)
+    if defer:
+        index.flush()
     if failures:
         sys.exit(1)
 

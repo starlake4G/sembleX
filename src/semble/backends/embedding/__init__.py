@@ -20,4 +20,5 @@ def create_embedding_provider(config: EmbeddingConfig | None = None) -> Embeddin
         max_retries=config.max_retries,
         max_concurrent=config.max_concurrent,
         max_context_tokens=config.max_context_tokens,
+        tokenizer=config.tokenizer,
     )

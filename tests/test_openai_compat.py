@@ -79,3 +79,30 @@ def test_encode_partial_failure_surfaces(provider: Any) -> None:
     assert 2 in info.value.failed_indices
     assert info.value.partial is not None
     assert info.value.partial.shape == (2, 4)
+
+
+def test_context_overflow_shrinks_and_recovers(provider: Any) -> None:
+    # Server rejects the input as too long twice, then accepts the shrunken payload —
+    # the chunk must be recovered, not dropped.
+    calls = {"n": 0}
+    err = RuntimeError("Error code: 400 - This model's maximum context length is 128 tokens. (input_tokens)")
+
+    def side_effect(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise err
+        return _fake_response([[1.0, 0.0, 0.0, 0.0]])
+
+    provider._token_budget = 4000  # above _MIN_BUDGET so shrink-retry engages
+    provider._client.embeddings.create.side_effect = side_effect
+    out = provider._encode_single("x" * 10_000)
+    assert out is not None
+    assert calls["n"] == 3  # two rejections (each shrinks) then success
+
+
+def test_is_context_overflow_detection() -> None:
+    from semble.backends.embedding.openai_compat import _is_context_overflow
+
+    assert _is_context_overflow(RuntimeError("maximum context length is 32768 tokens"))
+    assert _is_context_overflow(RuntimeError("parameter=input_tokens, value=32769"))
+    assert not _is_context_overflow(RuntimeError("connection reset"))
