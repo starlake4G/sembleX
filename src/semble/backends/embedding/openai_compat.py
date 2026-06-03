@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -13,7 +13,7 @@ from semble.interfaces import EmbeddingFailure, EmbeddingMatrix, EmbeddingProvid
 logger = logging.getLogger(__name__)
 
 
-def _token_counter(model: str) -> "callable[[str], int]":
+def _token_counter(model: str) -> Callable[[str], int]:
     try:
         import tiktoken
     except ImportError:
@@ -72,20 +72,17 @@ class OpenAICompatEmbedding(EmbeddingProvider):
             for i, emb in enumerate(batch_result):
                 all_embeddings[i] = emb
         else:
-            batches = [
-                (i, text_list[i : i + self._batch_size])
-                for i in range(0, total, self._batch_size)
-            ]
+            batches = [(i, text_list[i : i + self._batch_size]) for i in range(0, total, self._batch_size)]
             logger.info(
                 "Encoding %d texts in %d batches (batch_size=%d, workers=%d)...",
-                total, len(batches), self._batch_size, self._max_concurrent,
+                total,
+                len(batches),
+                self._batch_size,
+                self._max_concurrent,
             )
             done_count = 0
             with ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
-                futures = {
-                    executor.submit(self._encode_batch, batch): start_idx
-                    for start_idx, batch in batches
-                }
+                futures = {executor.submit(self._encode_batch, batch): start_idx for start_idx, batch in batches}
                 for future in as_completed(futures):
                     start_idx = futures[future]
                     try:
@@ -103,7 +100,8 @@ class OpenAICompatEmbedding(EmbeddingProvider):
 
         if not successes:
             raise EmbeddingFailure(
-                f"All {total} embedding requests failed", failed_indices=failed_indices,
+                f"All {total} embedding requests failed",
+                failed_indices=failed_indices,
             )
 
         actual_dim = len(successes[0])
@@ -116,7 +114,8 @@ class OpenAICompatEmbedding(EmbeddingProvider):
             partial = self._normalize(np.array(successes, dtype=np.float32))
             logger.warning(
                 "Embedding partial failure: %d/%d texts failed; surfacing partial result",
-                len(failed_indices), total,
+                len(failed_indices),
+                total,
             )
             raise EmbeddingFailure(
                 f"{len(failed_indices)} of {total} embeddings failed",

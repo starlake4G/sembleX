@@ -13,8 +13,9 @@ def _expand_path(value: Path | str) -> Path:
 
 
 class EmbeddingConfig(BaseModel):
-    backend: Literal["model2vec", "openai_compat"] = "model2vec"
-    model: str = "minishlab/potion-code-16M"
+    """Self-hosted / code-specialized embedding via an OpenAI-compatible endpoint."""
+
+    backend: Literal["openai_compat"] = "openai_compat"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None
     openai_model: str = "text-embedding-3-small"
@@ -25,23 +26,23 @@ class EmbeddingConfig(BaseModel):
     max_context_tokens: int = 8192
 
 
-class VectorStoreConfig(BaseModel):
-    backend: Literal["numpy", "faiss"] = "numpy"
-    use_gpu: bool = False
-    index_type: Literal["flat", "ivf"] = "flat"
-    metric: Literal["ip", "l2"] = "ip"
-    ivf_nlist: int = 100
-
-
 class RerankerConfig(BaseModel):
-    backend: Literal["rules", "cross_encoder", "hybrid"] = "rules"
-    model: str | None = "BAAI/bge-reranker-v2-m3"
+    backend: Literal["rules"] = "rules"
     coarse_multiplier: int = 5
 
 
-class CacheConfig(BaseModel):
-    enabled: bool = True
-    dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "cache")
+class IndexingConfig(BaseModel):
+    """Settings that govern how files become chunks/embeddings."""
+
+    max_file_bytes: int = 1_000_000
+    embed_batch_size: int = 512
+
+
+class CoreDbConfig(BaseModel):
+    """Local core database: chunk metadata (SQLite) + global BM25 index + git clones."""
+
+    dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "core")
+    clone_timeout: int = 300
 
     @field_validator("dir", mode="before")
     @classmethod
@@ -49,52 +50,13 @@ class CacheConfig(BaseModel):
         return _expand_path(value) if isinstance(value, (str, Path)) else value
 
 
-class MonitorConfig(BaseModel):
-    enabled: bool = True
-    debounce_ms: int = 500
-
-
-class IndexingConfig(BaseModel):
-    """Settings that govern how files become chunks/embeddings.
-
-    Used by both the local index path and the remote server, so they cannot live
-    inside ``ServerConfig``.
-    """
-
-    max_file_bytes: int = 1_000_000
-    embed_batch_size: int = 512
-
-
-class IndexConfig(BaseModel):
-    backend: Literal["local", "remote"] = "local"
-
-
-class RemoteConfig(BaseModel):
-    base_url: str = "http://127.0.0.1:8080"
-    api_key: str | None = None
-    timeout: float = 120.0
-
-
-class ServerConfig(BaseModel):
-    host: str = "127.0.0.1"
-    port: int = 8080
-    api_key: str | None = None
-    work_dir: Path = Field(default_factory=lambda: Path.home() / ".semble" / "server")
-    clone_timeout: int = 300
-
-    @field_validator("work_dir", mode="before")
-    @classmethod
-    def _expand_work_dir(cls, value: object) -> object:
-        return _expand_path(value) if isinstance(value, (str, Path)) else value
-
-
 class MilvusConfig(BaseModel):
     uri: str = "http://127.0.0.1:19530"
     token: str | None = None
     db_name: str | None = None
-    collection: str = "semble_chunks"
+    collection: str = "semble_global"
     vector_field: str = "vector"
-    metric_type: Literal["COSINE", "IP", "L2"] = "COSINE"
+    metric_type: Literal["COSINE", "IP", "L2"] = "IP"
     index_type: str = "AUTOINDEX"
     index_params: dict[str, Any] = Field(default_factory=dict)
     search_params: dict[str, Any] = Field(default_factory=dict)
@@ -102,15 +64,10 @@ class MilvusConfig(BaseModel):
 
 
 class SembleConfig(BaseModel):
-    index: IndexConfig = Field(default_factory=IndexConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
-    vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
-    cache: CacheConfig = Field(default_factory=CacheConfig)
-    monitor: MonitorConfig = Field(default_factory=MonitorConfig)
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
-    remote: RemoteConfig = Field(default_factory=RemoteConfig)
-    server: ServerConfig = Field(default_factory=ServerConfig)
+    core: CoreDbConfig = Field(default_factory=CoreDbConfig)
     milvus: MilvusConfig = Field(default_factory=MilvusConfig)
 
 

@@ -1,540 +1,204 @@
-
 <h2 align="center">
-  <img width="30%" alt="sembleX logo" src="https://raw.githubusercontent.com/MinishLab/semble/main/assets/images/semble_logo.png"><br/>
-  Fast and Accurate Code Search for Agents — Extended<br/>
-  <sub>Uses ~98% fewer tokens than grep+read</sub>
+  SembleX — Cross-Repo Code Search for AI Agents<br/>
+  <sub>Index many repositories once, then search and find similar code across all of them</sub>
 </h2>
 
 <div align="center">
-  <h2>
-    <a href="https://github.com/starlake4G/sembleX"><img src="https://img.shields.io/badge/repo-sembleX-blue" alt="GitHub Repo"></a>
-    <a href="https://github.com/starlake4G/sembleX/blob/main/LICENSE">
-      <img src="https://img.shields.io/badge/license-MIT-green" alt="License - MIT">
-    </a>
-  </h2>
 
+[What it does](#what-it-does) •
+[Architecture](#architecture) •
+[Prerequisites](#prerequisites) •
+[Install](#install) •
+[Configuration](#configuration) •
 [Quickstart](#quickstart) •
-[MCP Server](#mcp-server) •
-[Bash / AGENTS.md](#bash-agentsmd) •
-[CLI](#cli) •
-[Remote Server](#remote-server) •
-[Benchmarks](#benchmarks) •
+[MCP](#mcp-integration) •
+[CLI](#cli-reference) •
+[How it works](#how-it-works) •
 [中文](README_CN.md)
 
 </div>
 
-SembleX is an extended fork of [Semble](https://github.com/MinishLab/semble), a code search library built for agents. It returns the exact code snippets they need instantly, using ~98% fewer tokens than grep+read. Indexing and searching a full codebase end-to-end takes under a second, with ~200x faster indexing and ~10x faster queries than a code-specialized transformer, at 99% of its retrieval quality (see [benchmarks](#benchmarks)). Everything runs on CPU with no API keys, GPU, or external services. Run it as an [MCP server](#mcp-server), a [standalone HTTP service](#remote-server), or call it from the shell via [AGENTS.md](#bash-agentsmd) and any agent (Claude Code, Cursor, Codex, OpenCode, etc.) gets instant access to any repo.
+SembleX is an aggressive fork of [Semble](https://github.com/MinishLab/semble) rebuilt for one job: **give an AI agent a single, global index across a large number of code repositories.** The agent can then (1) search every repo at once with a natural-language or symbol query, and (2) take any code location and find similar implementations in *other* repos to use as reference.
+
+It is **MCP-first**: the MCP server is the primary interface and holds a warm in-process index; the CLI is a thin client for indexing, debugging, and scripting. Dense vectors live in a remote **Milvus** collection; chunk content and the lexical index live in a compact **local core database**. This split keeps storage small (only `id + namespace + vector` go to Milvus) and indexing fast (embeddings are produced by a remote, code-specialized endpoint).
+
+## What it does
+
+Two capabilities, one engine:
+
+- **Cross-repo search** — `search("how is authentication handled")` returns the most relevant code chunks from *any* indexed repo, each attributed to its source repo (`repo :: file:line`).
+- **Cross-repo "find similar"** — `find_related(repo, file, line)` embeds the code at that location and returns semantically similar implementations from *other* repos (the source repo is excluded by default), so the agent can learn from how the same problem was solved elsewhere.
+
+Both reduce to the same pipeline: *produce a query vector → retrieve globally → fuse → rank*. A natural-language query and a code location are just two ways to produce that vector.
+
+## Architecture
+
+```
+        ┌──────────── warm in-process index (MCP daemon) ────────────┐
+  MCP ─▶│  GlobalIndex                                                │
+(core)  │   • MetadataStore  — SQLite: chunk content + repo_id        │─▶ Remote Milvus
+        │   • global BM25    — one IncrementalSparseIndex (persisted) │     (one collection,
+  CLI ─▶│   • rules ranking  — code-aware boosts/penalties            │      namespace = repo_id,
+(debug) │                                                             │      stores id + ns + vector only)
+        └─────────────────────────────────────────────────────────────┘─▶ Remote OpenAI-compatible
+                                                                            embedding endpoint
+```
+
+- **One global Milvus collection** holds every repo's dense vectors, partitioned by `namespace = repo_id`. Global search drops the namespace filter; single-repo search and `find_related`'s source-repo exclusion use it.
+- **One global BM25 index** (lexical) covers all chunks, keyed by a globally-unique `chunk_id` (the hash includes `repo_id`). Re-indexing a repo removes its old chunk ids and adds the new ones incrementally.
+- **Local core database** (default `~/.semble/core`) holds `metadata.sqlite3` (chunk content + repo metadata) and `sparse/` (the persisted BM25 index). The MCP process keeps these warm; CLI invocations reload the BM25 index when its file mtime changes.
+
+## Prerequisites
+
+Unlike upstream Semble, SembleX is **not** zero-setup — it relies on two services you point it at:
+
+1. **A Milvus instance** (local or remote). For a quick local one:
+   ```bash
+   docker run -d --name milvus -p 19530:19530 milvusdb/milvus:standalone
+   ```
+2. **An OpenAI-compatible embedding endpoint**, ideally a self-hosted / code-specialized model. Any server exposing `POST /v1/embeddings` works (vLLM, TEI, Ollama, OpenAI itself, …). The embedding **dimension is configurable** — set it to match your model.
+
+## Install
+
+From a built wheel (recommended for deployment — installs standalone, no dependency on the source tree):
+
+```bash
+# build once
+uv build --wheel                # produces dist/semblex-<version>-py3-none-any.whl
+
+# install into your environment (conda base, venv, etc.) with all extras
+pip install "dist/semblex-<version>-py3-none-any.whl[all]"
+```
+
+Or directly from source:
+
+```bash
+pip install ".[all]"            # or: uv tool install ".[all]"
+```
+
+Extras: `mcp` (MCP server), `yaml` (YAML config), `tokenizer` (tiktoken token counting), `all` (= all three). The console command is `semble`.
+
+## Configuration
+
+Create `semble.yaml` (YAML or JSON; env vars like `${VAR:-default}` are substituted). All keys have defaults; the example below shows the ones you'll usually set:
+
+```yaml
+embedding:
+  backend: openai_compat
+  openai_base_url: http://your-embed-host:8000/v1   # OpenAI-compatible endpoint
+  openai_api_key: ${SEMBLE_EMBED_KEY:-dummy}        # many self-hosted servers ignore this
+  openai_model: your-code-embedding-model
+  openai_dim: 2048                                  # MUST match your model's output dim
+  max_context_tokens: 32768
+
+milvus:
+  uri: http://your-milvus-host:19530
+  collection: semble_global
+  metric_type: IP                                   # vectors are L2-normalized → IP == cosine
+
+core:
+  dir: ~/.semble/core                               # local SQLite + BM25 + git clones
+
+reranker:
+  backend: rules                                    # lightweight code-aware ranking
+```
+
+Config is loaded via `--config <path>`, the `SEMBLE_CONFIG` env var, or auto-discovery (`./semble.yaml`, `~/.config/semble/config.yaml`, `~/.semble/config.yaml`, …).
 
 ## Quickstart
 
-Your agent queries SembleX in natural language (e.g. `"How is authentication handled?"`) and gets back only the relevant code snippets, without grepping or reading full files. Set it up as an MCP server or via AGENTS.md:
-
-### MCP (Claude Code)
-
-Add SembleX to Claude Code (requires [uv](https://docs.astral.sh/uv/getting-started/installation/)):
-
 ```bash
-claude mcp add semblex -s user -- uvx --from "semblex[mcp]" semblex
+# 1. Register repos. Either add them one by one…
+semble --config semble.yaml projects add /path/to/repo-a
+semble --config semble.yaml projects add https://github.com/some-org/repo-b
+# …or scan a directory tree and register every git repo under it:
+semble --config semble.yaml projects scan /path/to/all/my/repos --depth 3
+
+# 2. Build the global index (embeds + writes to Milvus + builds BM25)
+semble --config semble.yaml index --all
+
+# 3. Search across every indexed repo
+semble --config semble.yaml search "incremental sparse BM25 index add and remove" -k 8
+
+# 4. From a result's repo/file/line, find similar code in OTHER repos
+semble --config semble.yaml find-related /path/to/repo-a src/foo/chunking.py 42 -k 6
+
+# 5. Inspect the index
+semble --config semble.yaml status
 ```
 
-Using another agent harness? See [MCP Server](#mcp-server) below for per-agent setup.
+A single repo can be (re)indexed by passing its path/URL instead of `--all`: `semble index /path/to/repo-a` (no-op if unchanged; use `reindex` or `--force` to rebuild).
 
-### Bash / AGENTS.md
+## MCP integration
 
-Install SembleX, then add the snippet below to your `AGENTS.md` or `CLAUDE.md`:
-
-```bash
-pip install semblex       # Install with pip
-uv tool install semblex   # Or install with uv
-```
-
-<details>
-<summary>AGENTS.md / CLAUDE.md snippet</summary>
-
-```markdown
-## Code Search
-
-Use `semblex search` to find code by describing what it does or naming a symbol/identifier, instead of grep:
-
-​```bash
-semblex search "authentication flow" ./my-project
-semblex search "save_pretrained" ./my-project
-semblex search "save model to disk" ./my-project --top-k 10
-​```
-
-Use `semblex find-related` to discover code similar to a known location (pass `file_path` and `line` from a prior search result):
-
-​```bash
-semblex find-related src/auth.py 42 ./my-project
-​```
-
-`path` defaults to the current directory when omitted; git URLs are accepted.
-
-If `semblex` is not on `$PATH`, use `uvx --from "semblex[mcp]" semblex` in its place.
-
-### Workflow
-
-1. Start with `semblex search` to find relevant chunks.
-2. Inspect full files only when the returned chunk is not enough context.
-3. Optionally use `semblex find-related` with a promising result's `file_path` and `line` to discover related implementations.
-4. Use grep only when you need exhaustive literal matches or quick confirmation of an exact string.
-```
-
-</details>
-
-Note that sub-agents cannot call MCP tools directly, see [Bash / AGENTS.md](#bash-agentsmd) and [sub-agent setup](#sub-agent-setup) below for details.
-
-<details>
-<summary>Updating SembleX</summary>
-
-```bash
-pip install --upgrade semblex   # with pip
-uv tool upgrade semblex         # with uv
-uv cache clean semblex          # for MCP users (restart your MCP client after)
-```
-
-</details>
-
-## Main Features
-
-- **Fast**: indexes an average repo in ~250 ms and answers queries in ~1.5 ms, all on CPU.
-- **Accurate**: NDCG@10 of 0.854 on our [benchmarks](#benchmarks), on par with code-specialized transformer models, at a fraction of the size and cost.
-- **Token-efficient**: returns only the relevant chunks, using [~98% fewer tokens than grep+read](#benchmarks).
-- **Zero setup**: runs on CPU with no API keys, GPU, or external services required.
-- **MCP server**: works with Claude Code, Cursor, Codex, OpenCode, VS Code, and any other MCP-compatible agent.
-- **Local and remote**: pass a local path or a git URL.
-- **Pluggable backends**: swap embedding (Model2Vec / OpenAI-compatible), vector store (NumPy / FAISS / Milvus), and reranker (rules / cross-encoder / hybrid) backends via a single config file.
-- **Remote server mode**: run SembleX as a standalone FastAPI service with Milvus-backed storage, API key auth, and a remote client for CLI/MCP.
-- **Configurable**: YAML config with env-var substitution for all backend and server settings.
-
-## MCP Server
-
-SembleX can run as an MCP server so agents can search any codebase directly. Repos are cloned and indexed on demand, and indexes are cached for the lifetime of the session. Local paths are watched for file changes and re-indexed automatically.
-
-### Setup
-
-> Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) to be installed.
-
-<details>
-<summary>Claude Code</summary>
-
-```bash
-claude mcp add semblex -s user -- uvx --from "semblex[mcp]" semblex
-```
-
-</details>
-
-<details>
-<summary>Cursor</summary>
-
-Add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in your project):
-
-```json
-{
-  "mcpServers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>Codex</summary>
-
-Add to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.semblex]
-command = "uvx"
-args = ["--from", "semblex[mcp]", "semblex"]
-```
-
-</details>
-
-<details>
-<summary>OpenCode</summary>
-
-Add to `~/.opencode/config.json`:
-
-```json
-{
-  "mcp": {
-    "semblex": {
-      "type": "local",
-      "command": ["uvx", "--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>VS Code</summary>
-
-Add to `.vscode/mcp.json` in your project (or your user profile's `mcp.json`):
-
-```json
-{
-  "servers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>GitHub Copilot CLI</summary>
-
-Add to `~/.copilot/mcp-config.json`:
-
-```json
-{
-  "mcpServers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>Windsurf</summary>
-
-Add to `~/.codeium/windsurf/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>Gemini CLI</summary>
-
-Add to `~/.gemini/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>Kiro</summary>
-
-Add to `~/.kiro/settings/mcp.json` (or `.kiro/settings/mcp.json` in your project):
-
-```json
-{
-  "mcpServers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary>Zed</summary>
-
-Add to `~/.config/zed/settings.json` (or `.zed/settings.json` in your project):
-
-```json
-{
-  "context_servers": {
-    "semblex": {
-      "command": "uvx",
-      "args": ["--from", "semblex[mcp]", "semblex"]
-    }
-  }
-}
-```
-
-</details>
-
+The MCP server is the primary interface. It builds one warm `GlobalIndex` at startup and serves two tools over stdio.
 
 ### Tools
 
 | Tool | Description |
 |------|-------------|
-| `search` | Search a codebase with a natural-language or code query. Pass `repo` as a local directory path or an https:// git URL. |
-| `find_related` | Given a file path and line number, return chunks semantically similar to the code at that location. |
+| `search(query, top_k=5, scope="global", repo=None)` | Search indexed repos. `scope="global"` (default) spans every repo — best for finding reference implementations elsewhere; `scope="workspace"` restricts to the repo containing the server's working directory (the active project). `repo` optionally pins a specific repo by path/URL and overrides `scope`. Each result is attributed to its source repo. |
+| `find_related(repo, file_path, line, top_k=5)` | Given a location (use the `repo`/`file_path`/`line` from a prior `search` result), return semantically similar code from *other* repos. The source repo is excluded. |
 
+> **Scope.** `scope="workspace"` resolves the MCP server's launch directory to whichever indexed repo contains it (a subdirectory works too). MCP clients spawn the server in the active project directory, so this maps to "search only the current project". If that directory isn't indexed, the tool says so and suggests `scope="global"`.
 
-<a id="bash-agentsmd"></a>
-
-## Bash / AGENTS.md
-
-An alternative to MCP is to invoke SembleX via Bash. Sub-agents cannot call MCP tools directly, so this is the only option for sub-agent support; it can also be used alongside MCP for the top-level agent.
-
-To add Bash support, append the following to your `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, or equivalent:
-
-```markdown
-## Code Search
-
-Use `semblex search` to find code by describing what it does or naming a symbol/identifier, instead of grep:
-
-​```bash
-semblex search "authentication flow" ./my-project
-semblex search "save_pretrained" ./my-project
-semblex search "save model to disk" ./my-project --top-k 10
-​```
-
-Use `semblex find-related` to discover code similar to a known location (pass `file_path` and `line` from a prior search result):
-
-​```bash
-semblex find-related src/auth.py 42 ./my-project
-​```
-
-`path` defaults to the current directory when omitted; git URLs are accepted.
-
-If `semblex` is not on `$PATH`, use `uvx --from "semblex[mcp]" semblex` in its place.
-
-## Workflow
-
-1. Start with `semblex search` to find relevant chunks.
-2. Inspect full files only when the returned chunk is not enough context.
-3. Optionally use `semblex find-related` with a promising result's `file_path` and `line` to discover related implementations.
-4. Use grep only when you need exhaustive literal matches or quick confirmation of an exact string.
-```
-
-### Sub-agent setup
-
-Claude Code, Gemini CLI, Cursor, OpenCode, GitHub Copilot CLI, and Kiro all support a dedicated semblex search sub-agent. Run `semblex init` once in your project root:
+### Register with Claude Code
 
 ```bash
-semblex init                      # Claude Code  → .claude/agents/semblex-search.md
-semblex init --agent gemini       # Gemini CLI   → .gemini/agents/semblex-search.md
-semblex init --agent cursor       # Cursor       → .cursor/agents/semblex-search.md
-semblex init --agent opencode     # OpenCode     → .opencode/agents/semblex-search.md
-semblex init --agent copilot      # Copilot CLI  → .github/agents/semblex-search.md
-semblex init --agent kiro         # Kiro         → .kiro/agents/semblex-search.md
+claude mcp add semblex -s user -- semble --config /abs/path/to/semble.yaml serve
 ```
-
-If semblex is not on `$PATH`, prefix the command with `uvx --from "semblex[mcp]"`.
-
-## CLI
-
-SembleX also ships as a standalone CLI. This is useful in scripts or anywhere you want search results without an MCP session.
-
-```bash
-# Search a local repo
-semblex search "authentication flow" ./my-project
-
-# Search for a symbol or identifier
-semblex search "save_pretrained" ./my-project
-
-# Search a remote repo (cloned on demand)
-semblex search "save model to disk" https://github.com/MinishLab/model2vec
-
-# Limit results
-semblex search "save model to disk" ./my-project --top-k 10
-
-# Find code similar to a known location
-semblex find-related src/auth.py 42 ./my-project
-```
-
-`path` defaults to the current directory when omitted; git URLs are accepted. If `semblex` is not on `$PATH`, use `uvx --from "semblex[mcp]" semblex` in its place.
 
 <details>
-<summary>Savings</summary>
+<summary>Other agents (Cursor, Codex, VS Code, …)</summary>
 
-`semblex savings` shows how many tokens semblex has saved across all your searches:
+Use the same command in each harness's MCP config. For example, Cursor (`~/.cursor/mcp.json`):
 
-```bash
-semblex savings           # summary by period
-semblex savings --verbose # also show breakdown by call type
+```json
+{
+  "mcpServers": {
+    "semblex": {
+      "command": "semble",
+      "args": ["--config", "/abs/path/to/semble.yaml", "serve"]
+    }
+  }
+}
 ```
 
-```
-  SembleX Token Savings
-  ════════════════════════════════════════════════════════════════
-  Period        Calls   Savings
-  ────────────────────────────────────────────────────────────────
-  Today         42      [███████████████░]  ~58.4k tokens (95%)
-  Last 7 days   287     [██████████████░░]  ~312.4k tokens (90%)
-  All time      1.4k    [██████████████░░]  ~1.2M tokens (89%)
-```
-
-Savings are calculated as follows: for each call, semblex records the total character count of the unique files containing returned chunks and the character count of the snippets returned. Estimated tokens saved is `(file chars − snippet chars) / 4` (4 chars per token). This is a conservative estimate: the baseline is reading matched files in full, which is how coding agents often explore unfamiliar code.
-
-Stats are stored in `~/.semblex/savings.jsonl`.
+The pattern is identical for Codex (`~/.codex/config.toml`), VS Code (`.vscode/mcp.json`), Windsurf, Gemini CLI, etc. — set `command` to `semble` (or an absolute path to it) and `args` to `["--config", "<path>", "serve"]`.
 
 </details>
 
-<details>
-<summary>Library usage</summary>
+> Indexing is done out-of-band via the CLI (`semble index ...`). The MCP server reads the index that the CLI builds; it reloads the BM25 portion automatically when the on-disk index changes.
 
-SembleX can also be used as a Python library for programmatic access, useful when building custom tooling or integrating search directly into your own code.
+## CLI reference
 
-```python
-from semble import SembleIndex
+`semble [--config PATH] <command>`
 
-# Index a local directory
-index = SembleIndex.from_path("./my-project")
-
-# Index a remote git repository
-index = SembleIndex.from_git("https://github.com/MinishLab/model2vec")
-
-# Search the index with a natural-language or code query
-results = index.search("save model to disk", top_k=3)
-
-# Find code similar to a specific result
-related = index.find_related(results[0], top_k=3)
-
-# Each result exposes the matched chunk
-result = results[0]
-result.chunk.file_path   # "model2vec/model.py"
-result.chunk.start_line  # 127
-result.chunk.end_line    # 150
-result.chunk.content     # "def save_pretrained(self, path: PathLike, ..."
-```
-
-</details>
-
-<a id="remote-server"></a>
-
-## Remote Server
-
-SembleX can run as a standalone FastAPI HTTP service, enabling remote indexing and search over the network. This is useful for shared team setups or when you want to offload indexing to a dedicated machine.
-
-### Quick Start
-
-```bash
-# 1. Start Milvus (vector database)
-docker run -d --name milvus -p 19530:19530 milvusdb/milvus:standalone
-
-# 2. Start the SembleX server
-semblex server --config examples/openai_compat.yaml
-
-# 3. Index a repository
-semblex index https://github.com/some-org/some-repo
-
-# 4. Search
-semblex search "authentication flow" https://github.com/some-org/some-repo
-```
-
-### Configuration
-
-Create a YAML config file (see `examples/openai_compat.yaml`):
-
-```yaml
-index:
-  backend: remote            # "local" for direct indexing, "remote" to use a server
-
-embedding:
-  backend: openai_compat     # or "model2vec"
-  openai_base_url: https://api.openai.com/v1
-  openai_api_key: ${SEMBLE_EMBED_API_KEY:-}
-
-vector_store:
-  backend: faiss             # or "numpy"
-
-reranker:
-  backend: rules             # or "cross_encoder" / "hybrid"
-
-remote:
-  base_url: http://127.0.0.1:8080
-  api_key: ${SEMBLE_REMOTE_API_KEY:-}
-
-server:
-  host: 0.0.0.0
-  port: 8080
-  api_key: ${SEMBLE_SERVER_API_KEY:-}
-
-milvus:
-  uri: http://127.0.0.1:19530
-  collection: semblex_chunks
-```
-
-### API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/v1/index` | POST | Index a repository |
-| `/v1/search` | POST | Search an indexed repository |
-| `/v1/find-related` | POST | Find related chunks |
-
-All endpoints support Bearer token authentication when `server.api_key` is configured.
-
-## Benchmarks
-
-We benchmark quality and speed across ~1,250 queries over 63 repositories in 19 languages (left), and token efficiency against grep+read at equivalent recall levels (right).
-
-<table>
-<tr>
-<td><img src="https://raw.githubusercontent.com/MinishLab/semble/main/assets/images/speed_vs_ndcg_cold.png" alt="Speed vs quality"></td>
-<td><img src="https://raw.githubusercontent.com/MinishLab/semble/main/assets/images/token_efficiency.png" alt="Token efficiency: recall vs. retrieved tokens"></td>
-</tr>
-</table>
-
-The quality benchmark (left) scores retrieval quality (NDCG@10) against total latency; semblex achieves 99% of the quality of the 137M-parameter [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed) Hybrid while indexing 218x faster. The token efficiency benchmark (right) measures how many tokens each method needs to reach a given recall level; semblex uses 98% fewer tokens on average and hits 94% recall at only 2k tokens, while grep+read needs a full 100k context window to reach 85%. See [benchmarks](benchmarks/README.md) for per-language results, ablations, and full methodology.
+| Command | Purpose |
+|---------|---------|
+| `serve` | Run the cross-repo MCP server over stdio (default when no subcommand is given). |
+| `index [source] [--all] [--ref REF] [--include-text-files] [--force]` | Index a repo (local path or git URL) into the global index, or `--all` registered projects. `--ref` selects a branch/tag for git URLs; `--include-text-files` also indexes non-code text; `--force` rebuilds. |
+| `reindex [source] [--all] ...` | Alias for `index --force`. |
+| `search <query> [--scope global\|workspace] [--repo REPO] [-k N]` | Search indexed repos. `--scope workspace` restricts to the repo containing the current directory; `--repo` pins a specific repo by path/URL (overrides `--scope`). |
+| `find-related <repo> <file_path> <line> [-k N] [--include-source-repo]` | Find code similar to a location. `repo` is the source repo path/URL from a search result's `repo:` line. By default the source repo is excluded; `--include-source-repo` keeps it. |
+| `status` | Show repo count, chunk count, embedding model/dim, Milvus URI, and registered sources. |
+| `projects add <source> [--name N] [--ref REF] [--include-text-files]` | Register a local path or git URL. |
+| `projects scan <root> [--depth N]` | Register every git repo found under `root` (default depth 3). |
+| `projects list` / `projects remove <source>` | List / unregister projects. |
 
 ## How it works
 
-SembleX splits each file into code-aware chunks using [tree-sitter](https://github.com/tree-sitter/py-tree-sitter), then scores every query against the chunks with two complementary retrievers: static [Model2Vec](https://github.com/MinishLab/model2vec) embeddings using the code-specialized [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M) model for semantic similarity, and [BM25](https://github.com/xhluca/bm25s) for lexical matches on identifiers and API names. The two score lists are fused with Reciprocal Rank Fusion (RRF).
+SembleX splits each file into code-aware chunks with [tree-sitter](https://github.com/tree-sitter/py-tree-sitter), then retrieves with two complementary signals fused by Reciprocal Rank Fusion (RRF):
 
-After fusing, results are reranked with a set of code-aware signals:
+- **Dense** — embeddings from your OpenAI-compatible endpoint, L2-normalized and stored in Milvus (cosine via inner product).
+- **Lexical** — a global BM25 index over identifiers and API names.
 
-<details>
-<summary><b>Ranking signals</b></summary>
+After fusion, results are reranked with code-aware signals (adaptive symbol/NL weighting, definition boosts, identifier-stem matching, file coherence, and noise penalties for test/legacy/example/stub code). In cross-repo mode these ranking signals are computed **per repo and then merged**, so file-coherence stays repo-scoped and identically-named files in different repos never collide.
 
-- **Adaptive weighting.** Symbol-like queries (`Foo::bar`, `_private`, `getUserById`) get more lexical weight, while natural-language queries stay balanced between semantic and lexical retrievers.
-- **Definition boosts.** A chunk that defines the queried symbol (a `class`, `def`, `func`, etc.) is ranked above chunks that merely reference it.
-- **Identifier stems.** Query tokens are stemmed and matched against identifier stems in a chunk, giving an additional weight to chunks that contain them. For example, querying `parse config` boosts chunks containing `parseConfig`, `ConfigParser`, or `config_parser`.
-- **File coherence.** When multiple chunks from the same file match the query, the file is boosted so the top result reflects broad file-level relevance rather than a single out-of-context chunk.
-- **Noise penalties.** Test files, `compat/`/`legacy/` shims, example code, and `.d.ts` declaration stubs are down-ranked so canonical implementations surface first.
+### Storage footprint
 
-</details>
-
-Because the embedding model is static with no transformer forward pass at query time, all of this runs in milliseconds on CPU.
+The split-storage design is what keeps SembleX small. Milvus stores **only** `chunk_id + namespace + vector`; chunk *content* lives in the local SQLite database. As a reference point, indexing two repos (~600 chunks at dim 2048) produced ≈ **3.9 MB** local core (1.1 MB SQLite content + 2.9 MB BM25) and ≈ **4.9 MB** of raw vectors in Milvus. You can shrink it further by lowering `embedding.openai_dim`.
 
 ## License
 
-MIT
-
-## Citing
-
-If you use SembleX in your research, please cite the following:
-
-```bibtex
-@software{minishlab2026semble,
-  author       = {{van Dongen}, Thomas and Stephan Tulkens},
-  title        = {Semble: Fast and Accurate Code Search for Agents},
-  year         = {2026},
-  publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.19785932},
-  url          = {https://github.com/MinishLab/semble},
-  license      = {MIT}
-}
-```
+MIT. SembleX is a fork of [Semble](https://github.com/MinishLab/semble) by the MinishLab team; the original retrieval and ranking work is theirs.

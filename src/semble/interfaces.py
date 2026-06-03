@@ -11,8 +11,6 @@ from semble.types import Chunk
 
 EmbeddingMatrix = npt.NDArray[np.float32]
 
-LOCAL_NAMESPACE = "local"
-
 
 class EmbeddingFailure(RuntimeError):
     """Raised when an embedding provider cannot encode some or all inputs.
@@ -50,11 +48,9 @@ class EmbeddingProvider(ABC):
 class VectorStore(ABC):
     """Namespace + chunk_id keyed dense vector store.
 
-    Local backends (numpy/faiss) operate with a single namespace ("local").
-    Remote backends like Milvus use one namespace per indexed repository.
-
-    All identifiers are caller-supplied stable strings; backends keep the
-    chunk_id→vector mapping themselves so callers never reason about row
+    Each ``namespace`` maps to one indexed repository (``repo_id``). All
+    identifiers are caller-supplied stable strings; backends keep the
+    chunk_id->vector mapping themselves so callers never reason about row
     positions.
     """
 
@@ -63,9 +59,7 @@ class VectorStore(ABC):
     def dim(self) -> int: ...
 
     @abstractmethod
-    def add(
-        self, namespace: str, chunk_ids: Sequence[str], vectors: EmbeddingMatrix
-    ) -> None: ...
+    def add(self, namespace: str, chunk_ids: Sequence[str], vectors: EmbeddingMatrix) -> None: ...
 
     @abstractmethod
     def delete(self, namespace: str, chunk_ids: Sequence[str]) -> None: ...
@@ -81,14 +75,22 @@ class VectorStore(ABC):
         k: int,
         selector_ids: Sequence[str] | None = None,
     ) -> list[tuple[str, float]]:
-        """Return ``[(chunk_id, similarity)]`` sorted by similarity descending."""
+        """Return ``[(chunk_id, similarity)]`` for one namespace, similarity descending."""
         ...
 
     @abstractmethod
-    def save(self, path: Path) -> None: ...
+    def query_global(
+        self,
+        vector: EmbeddingMatrix,
+        k: int,
+        exclude_namespace: str | None = None,
+    ) -> list[tuple[str, str, float]]:
+        """Return ``[(chunk_id, namespace, similarity)]`` across all namespaces.
 
-    @abstractmethod
-    def load(self, path: Path) -> None: ...
+        When *exclude_namespace* is set, rows in that namespace are skipped
+        (used by cross-repo ``find_related`` to exclude the source repo).
+        """
+        ...
 
 
 class SparseIndex(ABC):
@@ -111,16 +113,14 @@ class SparseIndex(ABC):
     @abstractmethod
     def load(self, path: Path) -> None: ...
 
+    def add_documents(self, chunks: Sequence[Chunk], chunk_ids: Sequence[str]) -> None:
+        """Incrementally add documents. Default falls back to full rebuild."""
+        raise NotImplementedError
 
-class Reranker(ABC):
-    @abstractmethod
-    def rerank(
-        self,
-        query: str,
-        combined_scores: dict[Chunk, float],
-        all_chunks: list[Chunk],
-        top_k: int,
-        *,
-        penalise_paths: bool = True,
-        coarse_k: int | None = None,
-    ) -> list[tuple[Chunk, float]]: ...
+    def remove_documents(self, chunk_ids: Sequence[str]) -> None:
+        """Incrementally remove documents. Default no-op."""
+        raise NotImplementedError
+
+    @property
+    def supports_incremental(self) -> bool:
+        return False

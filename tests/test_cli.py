@@ -1,246 +1,127 @@
 import sys
-from importlib.resources import files
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from semble.cli import Agent, _agent_path, _cli_main, _run_init, main
-from semble.config import IndexConfig, SembleConfig
+from semble.cli import main
+from semble.projects import load_projects
+from semble.server.indexer import IndexOutcome
 from semble.types import SearchResult
 from tests.conftest import make_chunk
 
-_CLAUDE_FILE_PATH = _agent_path(Agent.CLAUDE)
 
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["semble", "/some/path", "--ref", "main"],
-        ["semble"],
-    ],
-)
-def test_main_calls_asyncio_run(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    """main() delegates to asyncio.run(serve(...)) when no CLI subcommand is given."""
-    monkeypatch.setattr(sys, "argv", argv)
-    with patch("asyncio.run") as mock_run:
-        mock_run.side_effect = lambda coro: coro.close()
-        main()
-    mock_run.assert_called_once()
-
-
-@pytest.mark.parametrize(
-    "argv, expected_in_output",
-    [
-        (["semble", "search", "query text", "/some/path"], ["query text", "0.9"]),
-        (["semble", "search", "nothing", "/some/path", "--top-k", "3"], ["No results found"]),
-    ],
-)
-def test_cli_search(
-    argv: list[str],
-    expected_in_output: list[str],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """_cli_main search subcommand calls index.search and prints results."""
-    chunk = make_chunk("def foo(): pass", "src/foo.py")
-    fake_index = MagicMock()
-    has_results = "No results" not in expected_in_output[0]
-    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)] if has_results else []
-    monkeypatch.setattr(sys, "argv", argv)
-    with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
-        _cli_main()
-    out = capsys.readouterr().out
-    for fragment in expected_in_output:
-        assert fragment in out
-
-
-@pytest.mark.parametrize(
-    ("scenario", "expected_stdout", "expected_stderr", "expected_exit_code"),
-    [
-        ("with_results", ["src/bar.py", "0.800"], None, None),
-        ("no_results", ["No related chunks found"], None, None),
-        ("unknown_chunk", [], "No chunk found", 1),
-    ],
-)
-def test_cli_find_related(
-    scenario: str,
-    expected_stdout: list[str],
-    expected_stderr: str | None,
-    expected_exit_code: int | None,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """_cli_main find-related prints results, empty states, and missing-chunk errors."""
-    chunk = make_chunk("class Bar: pass", "src/bar.py")
-    fake_index = MagicMock()
-    fake_index.chunks = [] if scenario == "unknown_chunk" else [chunk]
-    fake_index.find_related.return_value = [SearchResult(chunk=chunk, score=0.8)] if scenario == "with_results" else []
-    file_path = "unknown.py" if scenario == "unknown_chunk" else "src/bar.py"
-    monkeypatch.setattr(sys, "argv", ["semble", "find-related", file_path, "1", "/some/path"])
-    with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
-        if expected_exit_code is None:
-            _cli_main()
-        else:
-            with pytest.raises(SystemExit) as exc_info:
-                _cli_main()
-            assert exc_info.value.code == expected_exit_code
-    captured = capsys.readouterr()
-    for fragment in expected_stdout:
-        assert fragment in captured.out
-    if expected_stderr:
-        assert expected_stderr in captured.err
-
-
-def test_cli_remote_search(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """Remote mode sends search to the remote client instead of building a local index."""
-    cfg = SembleConfig(index=IndexConfig(backend="remote"))
-    client = MagicMock()
-    client.search.return_value = "remote search results"
-    monkeypatch.setattr(sys, "argv", ["semble", "search", "query", "/repo", "--top-k", "7"])
-
-    with (
-        patch("semble.cli.load_config", return_value=cfg),
-        patch("semble.cli.RemoteSembleClient.from_config", return_value=client),
-        patch("semble.cli.SembleIndex.from_path") as from_path,
-    ):
-        _cli_main()
-
-    from_path.assert_not_called()
-    client.search.assert_called_once_with("query", repo="/repo", top_k=7, include_text_files=False)
-    assert "remote search results" in capsys.readouterr().out
-
-
-def test_cli_remote_find_related(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """Remote mode resolves find-related remotely; no local chunk lookup is needed."""
-    cfg = SembleConfig(index=IndexConfig(backend="remote"))
-    client = MagicMock()
-    client.find_related.return_value = "remote related results"
-    monkeypatch.setattr(sys, "argv", ["semble", "find-related", "src/a.py", "3", "/repo"])
-
-    with (
-        patch("semble.cli.load_config", return_value=cfg),
-        patch("semble.cli.RemoteSembleClient.from_config", return_value=client),
-        patch("semble.cli.SembleIndex.from_path") as from_path,
-    ):
-        _cli_main()
-
-    from_path.assert_not_called()
-    client.find_related.assert_called_once_with(
-        "src/a.py",
-        3,
-        repo="/repo",
-        top_k=5,
-        include_text_files=False,
+def _result(content: str, path: str, repo_name: str, source: str, score: float) -> SearchResult:
+    return SearchResult(
+        chunk=make_chunk(content, path),
+        score=score,
+        repo_id=repo_name,
+        repo_name=repo_name,
+        repo_source=source,
     )
-    assert "remote related results" in capsys.readouterr().out
 
 
-def test_init_creates_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """_run_init writes the agent file and prints its path."""
-    monkeypatch.chdir(tmp_path)
-    _run_init(agent=agent)
-    dest = tmp_path / _agent_path(agent)
-    expected = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
-    assert dest.exists()
-    assert dest.read_text(encoding="utf-8") == expected
-    assert str(_agent_path(agent)) in capsys.readouterr().out
-
-
-def test_init_refuses_overwrite_without_force(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """_run_init exits with code 1 when the file exists and force=False."""
-    monkeypatch.chdir(tmp_path)
-    _run_init()
-    with pytest.raises(SystemExit) as exc_info:
-        _run_init()
-    assert exc_info.value.code == 1
-    assert "already exists" in capsys.readouterr().err
-
-
-def test_init_overwrites_with_force(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_run_init overwrites an existing file when force=True."""
-    monkeypatch.chdir(tmp_path)
-    dest = tmp_path / _CLAUDE_FILE_PATH
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text("old content", encoding="utf-8")
-    _run_init(force=True)
-    assert dest.read_text(encoding="utf-8") == files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8")
-
-
-def test_init_via_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """Semble init creates the Claude agent file via _cli_main."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["semble", "init"])
-    _cli_main()
-    assert (tmp_path / _CLAUDE_FILE_PATH).exists()
-    assert str(_CLAUDE_FILE_PATH) in capsys.readouterr().out
-
-
-def test_main_dispatches_to_cli(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """main() routes to _cli_main when first argument is a CLI subcommand."""
-    chunk = make_chunk("def foo(): pass", "src/foo.py")
-    fake_index = MagicMock()
-    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)]
-    monkeypatch.setattr(sys, "argv", ["semble", "search", "query text", "/some/path"])
-    with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
+def test_search_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.search.return_value = [_result("def foo(): pass", "src/foo.py", "repoA", "/x/repoA", 0.9)]
+    monkeypatch.setattr(sys, "argv", ["semble", "search", "foo"])
+    with patch("semble.cli._build_index", return_value=fake):
         main()
-    assert "query text" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "repoA :: src/foo.py" in out
+    assert "0.900" in out
 
 
-@pytest.mark.parametrize(
-    ("argv", "expected_stdout", "expect_system_exit"),
-    [
-        (["semble", "--help"], "find-related", True),
-        (["semble", "search", "query", "/some/path"], "query", False),
-    ],
-)
-def test_cli_entrypoint_works_without_mcp_installed(
-    argv: list[str],
-    expected_stdout: str,
-    expect_system_exit: bool,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_search_no_results(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.search.return_value = []
+    monkeypatch.setattr(sys, "argv", ["semble", "search", "nothing"])
+    with patch("semble.cli._build_index", return_value=fake):
+        main()
+    assert "No results found" in capsys.readouterr().out
+
+
+def test_find_related_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.find_related.return_value = [_result("class Bar: pass", "src/bar.py", "repoB", "/y", 0.8)]
+    monkeypatch.setattr(sys, "argv", ["semble", "find-related", "/y", "src/bar.py", "1"])
+    with patch("semble.cli._build_index", return_value=fake):
+        main()
+    out = capsys.readouterr().out
+    assert "src/bar.py" in out
+    _, kwargs = fake.find_related.call_args
+    assert kwargs["exclude_source_repo"] is True
+
+
+def test_index_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.index_repo.return_value = IndexOutcome(repo_id="r1", chunk_count=5, indexed=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(sys, "argv", ["semble", "index", str(repo)])
+    with patch("semble.cli._build_index", return_value=fake):
+        main()
+    assert "5 chunks" in capsys.readouterr().out
+    fake.index_repo.assert_called_once()
+
+
+def test_reindex_forces(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.index_repo.return_value = IndexOutcome(repo_id="r1", chunk_count=3, indexed=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(sys, "argv", ["semble", "reindex", str(repo)])
+    with patch("semble.cli._build_index", return_value=fake):
+        main()
+    _, kwargs = fake.index_repo.call_args
+    assert kwargs["force"] is True
+
+
+def test_status_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = MagicMock()
+    fake.status.return_value = {
+        "repos": 2, "chunks": 100, "embedding_model": "m", "embedding_dim": 768,
+        "milvus": "http://x", "core_dir": "/c", "sources": ["/a", "/b"],
+    }
+    monkeypatch.setattr(sys, "argv", ["semble", "status"])
+    with patch("semble.cli._build_index", return_value=fake):
+        main()
+    out = capsys.readouterr().out
+    assert "Repos indexed : 2" in out
+    assert "/a" in out and "/b" in out
+
+
+def test_projects_add_list_remove(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """CLI entrypoint paths succeed even when the mcp package is not installed."""
-    chunk = make_chunk("def foo(): pass", "src/foo.py")
-    fake_index = MagicMock()
-    fake_index.search.return_value = [SearchResult(chunk=chunk, score=0.9)]
-    monkeypatch.setattr(sys, "argv", argv)
-    monkeypatch.setitem(sys.modules, "mcp", None)
-    monkeypatch.setitem(sys.modules, "mcp.server", None)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", None)
-    monkeypatch.setitem(sys.modules, "semble.mcp", None)
-    with patch("semble.cli.SembleIndex.from_path", return_value=fake_index):
-        if expect_system_exit:
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-            assert exc_info.value.code == 0
-        else:
-            main()
-    assert expected_stdout in capsys.readouterr().out
+    registry = tmp_path / "projects.json"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("SEMBLE_PROJECTS_FILE", str(registry))
+
+    monkeypatch.setattr(sys, "argv", ["semble", "projects", "add", str(repo), "--name", "api"])
+    main()
+    assert "Added project: api" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["semble", "projects", "list"])
+    main()
+    assert "api" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["semble", "projects", "remove", str(repo)])
+    main()
+    assert "Removed project" in capsys.readouterr().out
+    assert load_projects().projects == []
 
 
-def test_mcp_main_exits_with_message_when_extras_missing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_projects_scan_registers_git_repos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """_mcp_main prints an actionable message and exits when mcp extras are not installed."""
-    monkeypatch.setattr(sys, "argv", ["semble"])
-    with patch("semble.cli.find_spec", return_value=None):
-        with pytest.raises(SystemExit) as exc_info:
-            main()
-    assert exc_info.value.code == 1
-    assert "pip install 'semble[mcp]'" in capsys.readouterr().err
-
-
-def test_agent_file_tools_are_bash_only() -> None:
-    """The agent file must list only Bash and Read — no MCP tools that require schema loading."""
-    frontmatter = files("semble").joinpath("agents/claude.md").read_text(encoding="utf-8").split("---")[1]
-    tools_line = next(line for line in frontmatter.splitlines() if line.startswith("tools:"))
-    tools = [t.strip() for t in tools_line.removeprefix("tools:").split(",")]
-    assert set(tools) == {"Bash", "Read"}, f"Unexpected tools in agent file: {tools}"
-    assert not any("mcp__" in t for t in tools)
+    registry = tmp_path / "projects.json"
+    (tmp_path / "repo-a" / ".git").mkdir(parents=True)
+    (tmp_path / "nested" / "repo-b" / ".git").mkdir(parents=True)
+    monkeypatch.setenv("SEMBLE_PROJECTS_FILE", str(registry))
+    monkeypatch.setattr(sys, "argv", ["semble", "projects", "scan", str(tmp_path), "--depth", "2"])
+    main()
+    assert "Registered 2 projects" in capsys.readouterr().out
+    sources = {entry.source for entry in load_projects().projects}
+    assert sources == {str((tmp_path / "repo-a").resolve()), str((tmp_path / "nested" / "repo-b").resolve())}

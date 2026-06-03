@@ -2,237 +2,281 @@ import argparse
 import asyncio
 import logging
 import sys
-from enum import Enum
-from importlib.resources import files
 from importlib.util import find_spec
 from pathlib import Path
 
-from model2vec.utils import get_package_extras
-
 from semble.config import SembleConfig, load_config
-from semble.index import SembleIndex
-from semble.remote import RemoteSembleClient
-from semble.stats import format_savings_report
-from semble.utils import _format_results, _is_git_url, _resolve_chunk
+from semble.projects import ProjectEntry, add_project, load_projects, remove_project
+from semble.utils import _format_results, _is_git_url
 
 logger = logging.getLogger(__name__)
 
 
-class Agent(str, Enum):
-    CLAUDE = "claude"
-    COPILOT = "copilot"
-    CURSOR = "cursor"
-    GEMINI = "gemini"
-    KIRO = "kiro"
-    OPENCODE = "opencode"
-
-
-_DEFAULT_AGENT = Agent.CLAUDE
-_CLI_DISPATCH_ARGS = frozenset({"search", "find-related", "index", "init", "savings", "server", "-h", "--help"})
-
-
-def _agent_path(agent: Agent) -> Path:
-    base_dir = ".github" if agent is Agent.COPILOT else f".{agent.value}"
-    return Path(base_dir) / "agents" / "semble-search.md"
-
-
 def main() -> None:
-    """Run the Semble command-line entrypoint."""
-    if len(sys.argv) > 1 and sys.argv[1] in _CLI_DISPATCH_ARGS:
-        _cli_main()
-    else:
-        _mcp_main()
+    """Run the Semble command-line entrypoint. With no subcommand, runs the MCP server."""
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.command in (None, "serve"):
+        _run_serve(args)
+        return
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+
+    if args.command == "projects":
+        _run_projects(args)
+        return
+
+    cfg = load_config(args.config)
+    if args.command in ("index", "reindex"):
+        _run_index(args, cfg)
+    elif args.command == "search":
+        _run_search(args, cfg)
+    elif args.command == "find-related":
+        _run_find_related(args, cfg)
+    elif args.command == "status":
+        _run_status(cfg)
 
 
-def _mcp_main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="semble",
-        description="Instant local code search for agents.",
-    )
-    parser.add_argument(
-        "path",
-        nargs="?",
-        default=None,
-        help="Local directory or git URL to pre-index at startup (optional).",
-    )
-    parser.add_argument("--ref", default=None, help="Branch or tag to check out (git URLs only).")
-    parser.add_argument(
-        "--include-text-files",
-        action="store_true",
-        help="Also index non-code text files (.md, .yaml, .json, etc.).",
+        description="Cross-repo code search for agents (MCP-first). Run with no subcommand to start the MCP server.",
     )
     parser.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
-    args = parser.parse_args()
-    if any(find_spec(dep) is None for dep in get_package_extras("semble", "mcp")):
-        print("MCP dependencies are not installed. Run: pip install 'semble[mcp]'", file=sys.stderr)
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("serve", help="Run the cross-repo MCP server (default when no subcommand is given).")
+
+    for name, help_text in (
+        ("index", "Index a repo into the global index."),
+        ("reindex", "Force re-index a repo (alias for index --force)."),
+    ):
+        idx = sub.add_parser(name, help=help_text)
+        idx.add_argument("source", nargs="?", help="Local path or https/http git URL.")
+        idx.add_argument("--all", action="store_true", help="Index all registered projects.")
+        idx.add_argument("--ref", default=None, help="Branch or tag (git URLs only).")
+        idx.add_argument("--include-text-files", action="store_true", help="Also index non-code text files.")
+        if name == "index":
+            idx.add_argument("--force", action="store_true", help="Rebuild even if already indexed.")
+
+    s = sub.add_parser("search", help="Search across all indexed repos.")
+    s.add_argument("query", help="Natural language or code/symbol query.")
+    s.add_argument(
+        "--scope",
+        choices=("global", "workspace"),
+        default="global",
+        help="'global' (default) searches every repo; 'workspace' restricts to the repo containing the "
+        "current directory. Ignored when --repo is given.",
+    )
+    s.add_argument("--repo", default=None, help="Restrict to a specific indexed repo by path/URL.")
+    s.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+
+    fr = sub.add_parser("find-related", help="Find similar code across repos for a location.")
+    fr.add_argument("repo", help="Source repo path/URL of the location (from a search result's repo: line).")
+    fr.add_argument("file_path", help="File path as shown in search results.")
+    fr.add_argument("line", type=int, help="Line number (1-indexed).")
+    fr.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
+    fr.add_argument("--include-source-repo", action="store_true", help="Do not exclude the source repo.")
+
+    sub.add_parser("status", help="Show global index status.")
+
+    projects_p = sub.add_parser("projects", help="Manage the repo registry used by `index --all`.")
+    projects_sub = projects_p.add_subparsers(dest="projects_command")
+    add_p = projects_sub.add_parser("add", help="Register a local path or https/http git URL.")
+    add_p.add_argument("source")
+    add_p.add_argument("--name", default=None)
+    add_p.add_argument("--ref", default=None)
+    add_p.add_argument("--include-text-files", action="store_true")
+    rm_p = projects_sub.add_parser("remove", help="Unregister a project.")
+    rm_p.add_argument("source")
+    projects_sub.add_parser("list", help="List registered projects.")
+    scan_p = projects_sub.add_parser("scan", help="Register all git repositories under a directory.")
+    scan_p.add_argument("root")
+    scan_p.add_argument("--depth", type=int, default=3, help="Maximum recursion depth (default: 3).")
+
+    return parser
+
+
+def _run_serve(args: argparse.Namespace) -> None:
+    if find_spec("mcp") is None:
+        print("MCP dependencies are not installed. Run: pip install 'semblex[mcp]'", file=sys.stderr)
         raise SystemExit(1)
     from semble.mcp import serve
 
-    cfg = load_config(args.config)
-    asyncio.run(serve(args.path, ref=args.ref, include_text_files=args.include_text_files, config=cfg))
+    asyncio.run(serve(load_config(args.config)))
 
 
-def _run_init(*, agent: Agent = _DEFAULT_AGENT, force: bool = False) -> None:
-    dest = _agent_path(agent)
-    if dest.exists() and not force:
-        print(f"{dest} already exists. Run with --force to overwrite.", file=sys.stderr)
-        sys.exit(1)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    content = files("semble").joinpath(f"agents/{agent.value}.md").read_text(encoding="utf-8")
-    dest.write_text(content, encoding="utf-8")
-    print(f"Created {dest}")
+def _build_index(cfg: SembleConfig):  # noqa: ANN202 — local helper, returns GlobalIndex
+    from semble.server.indexer import GlobalIndex
+
+    return GlobalIndex(cfg)
 
 
-def _run_remote_cli(args: argparse.Namespace, cfg: SembleConfig, include_text: bool) -> None:
-    client = RemoteSembleClient.from_config(cfg.remote)
-    try:
-        if args.command == "index":
-            print(
-                client.index(
-                    repo=args.path,
-                    include_text_files=include_text,
-                    force=args.force,
-                    ref=getattr(args, "ref", None),
-                )
-            )
-        elif args.command == "search":
-            print(client.search(args.query, repo=args.path, top_k=args.top_k, include_text_files=include_text))
-        elif args.command == "find-related":
-            print(
-                client.find_related(
-                    args.file_path,
-                    args.line,
-                    repo=args.path,
-                    top_k=args.top_k,
-                    include_text_files=include_text,
-                )
-            )
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+def _run_index(args: argparse.Namespace, cfg: SembleConfig) -> None:
+    force = args.command == "reindex" or getattr(args, "force", False)
+    index = _build_index(cfg)
 
-
-def _run_server(args: argparse.Namespace) -> None:
-    if find_spec("fastapi") is None or find_spec("uvicorn") is None or find_spec("pymilvus") is None:
-        print("Server dependencies are not installed. Run: pip install 'semble[server]'", file=sys.stderr)
-        sys.exit(1)
-
-    import uvicorn
-
-    from semble.server import create_app
-
-    cfg = load_config(args.config)
-    host = args.host or cfg.server.host
-    port = args.port or cfg.server.port
-    uvicorn.run(create_app(cfg), host=host, port=port)
-
-
-def _cli_main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        stream=sys.stderr,
-    )
-    parser = argparse.ArgumentParser(prog="semble")
-    sub = parser.add_subparsers(dest="command")
-
-    search_p = sub.add_parser("search", help="Search a codebase.")
-    search_p.add_argument("query", help="Natural language or code query.")
-    search_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
-    search_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
-    search_p.add_argument(
-        "--include-text-files",
-        action="store_true",
-        help="Also index non-code text files (.md, .yaml, .json, etc.).",
-    )
-    search_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
-
-    related_p = sub.add_parser("find-related", help="Find code similar to a specific location.")
-    related_p.add_argument("file_path", help="File path as shown in search results.")
-    related_p.add_argument("line", type=int, help="Line number (1-indexed).")
-    related_p.add_argument("path", nargs="?", default=".", help="Local path or git URL (default: current directory).")
-    related_p.add_argument("-k", "--top-k", type=int, default=5, help="Number of results (default: 5).")
-    related_p.add_argument(
-        "--include-text-files",
-        action="store_true",
-        help="Also index non-code text files (.md, .yaml, .json, etc.).",
-    )
-    related_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
-
-    index_p = sub.add_parser("index", help="Build or refresh a remote index.")
-    index_p.add_argument("path", help="Local server path or https/http git URL to index remotely.")
-    index_p.add_argument(
-        "--include-text-files",
-        action="store_true",
-        help="Also index non-code text files (.md, .yaml, .json, etc.).",
-    )
-    index_p.add_argument("--force", action="store_true", help="Rebuild the remote index even if it already exists.")
-    index_p.add_argument("--ref", default=None, help="Branch or tag to check out (git URLs only).")
-    index_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
-
-    init_p = sub.add_parser("init", help="Write a semble sub-agent file for your coding agent.")
-    init_p.add_argument(
-        "--agent",
-        "-a",
-        default=_DEFAULT_AGENT.value,
-        choices=[a.value for a in Agent],
-        help=f"Coding agent to set up (default: {_DEFAULT_AGENT.value}).",
-    )
-    init_p.add_argument("--force", action="store_true", help="Overwrite if the file already exists.")
-
-    savings_p = sub.add_parser("savings", help="Show token savings and usage stats.")
-    savings_p.add_argument("--verbose", action="store_true", help="Also show usage breakdown by call type.")
-
-    server_p = sub.add_parser("server", help="Run the remote Milvus-backed index service.")
-    server_p.add_argument("--host", default=None, help="Host to bind (default: config server.host).")
-    server_p.add_argument("--port", type=int, default=None, help="Port to bind (default: config server.port).")
-    server_p.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
-
-    args = parser.parse_args()
-
-    if args.command == "init":
-        _run_init(agent=Agent(args.agent), force=args.force)
-        return
-
-    if args.command == "savings":
-        print(format_savings_report(verbose=args.verbose), end="")
-        return
-
-    if args.command == "server":
-        _run_server(args)
-        return
-
-    cfg = load_config(getattr(args, "config", None))
-    include_text = args.include_text_files
-
-    if args.command == "index" and cfg.index.backend != "remote":
-        print("The index command requires index.backend: remote.", file=sys.stderr)
-        sys.exit(1)
-
-    if cfg.index.backend == "remote":
-        _run_remote_cli(args, cfg, include_text)
-        return
-
-    index = (
-        SembleIndex.from_git(args.path, include_text_files=include_text, config=cfg)
-        if _is_git_url(args.path)
-        else SembleIndex.from_path(args.path, include_text_files=include_text, config=cfg)
-    )
-
-    if args.command == "search":
-        results = index.search(args.query, top_k=args.top_k)
-        if not results:
-            print("No results found.")
-        else:
-            print(_format_results(f"Search results for: {args.query!r}", results))
-
-    elif args.command == "find-related":
-        chunk = _resolve_chunk(index.chunks, args.file_path, args.line)
-        if chunk is None:
-            print(f"No chunk found at {args.file_path}:{args.line}.", file=sys.stderr)
+    if args.all:
+        entries = load_projects().projects
+        if not entries:
+            print("No projects registered. Use `semble projects add <path>` first.", file=sys.stderr)
             sys.exit(1)
-        results = index.find_related(chunk, top_k=args.top_k)
-        if not results:
-            print(f"No related chunks found for {args.file_path}:{args.line}.")
+    elif args.source:
+        entries = [ProjectEntry(source=args.source, ref=args.ref, include_text_files=args.include_text_files)]
+    else:
+        print("Provide a <source> or use --all.", file=sys.stderr)
+        sys.exit(1)
+
+    failures = 0
+    for entry in entries:
+        try:
+            outcome = index.index_repo(
+                entry.source,
+                include_text_files=entry.include_text_files or args.include_text_files,
+                force=force,
+                ref=entry.ref or args.ref,
+            )
+            state = "indexed" if outcome.indexed else "already indexed (use --force)"
+            print(f"{entry.display_name}: {state}, {outcome.chunk_count} chunks")
+        except Exception as exc:  # noqa: BLE001 — report per-repo and continue.
+            failures += 1
+            print(f"{entry.display_name}: FAILED — {exc}", file=sys.stderr)
+    if failures:
+        sys.exit(1)
+
+
+def _run_search(args: argparse.Namespace, cfg: SembleConfig) -> None:
+    from semble.server.metadata import RepoNotIndexedError
+
+    index = _build_index(cfg)
+    target = args.repo
+    if target is None and args.scope == "workspace":
+        target = str(Path.cwd())
+    try:
+        results = index.search(args.query, top_k=args.top_k, repo=target)
+    except RepoNotIndexedError as exc:
+        print(f"{exc}. Index it first with `semble index {target}`, or use --scope global.", file=sys.stderr)
+        sys.exit(1)
+    if not results:
+        print("No results found.")
+        return
+    scope = f" in {target}" if target else ""
+    print(_format_results(f"Cross-repo search results{scope} for: {args.query!r}", results))
+
+
+def _run_find_related(args: argparse.Namespace, cfg: SembleConfig) -> None:
+    from semble.server.metadata import RepoNotIndexedError
+
+    index = _build_index(cfg)
+    try:
+        results = index.find_related(
+            args.file_path,
+            args.line,
+            repo=args.repo,
+            top_k=args.top_k,
+            exclude_source_repo=not args.include_source_repo,
+        )
+    except RepoNotIndexedError as exc:
+        print(f"{exc}. Index it first with `semble index {args.repo}`.", file=sys.stderr)
+        sys.exit(1)
+    if not results:
+        print(f"No related code found for {args.file_path}:{args.line}.")
+        return
+    print(_format_results(f"Code related to {args.file_path}:{args.line}", results))
+
+
+def _run_status(cfg: SembleConfig) -> None:
+    index = _build_index(cfg)
+    status = index.status()
+    print(f"Repos indexed : {status['repos']}")
+    print(f"Chunks        : {status['chunks']}")
+    print(f"Embedding     : {status['embedding_model']} (dim={status['embedding_dim']})")
+    print(f"Milvus        : {status['milvus']}")
+    print(f"Core dir      : {status['core_dir']}")
+    sources = status["sources"]
+    if isinstance(sources, list) and sources:
+        print("Sources:")
+        for source in sources:
+            print(f"  {source}")
+
+
+def _run_projects(args: argparse.Namespace) -> None:
+    if args.projects_command == "add":
+        _projects_add(args.source, name=args.name, ref=args.ref, include_text_files=args.include_text_files)
+    elif args.projects_command == "remove":
+        if remove_project(args.source):
+            print(f"Removed project: {args.source}")
         else:
-            print(_format_results(f"Chunks related to {args.file_path}:{args.line}", results))
+            print(f"Project not found: {args.source}", file=sys.stderr)
+            sys.exit(1)
+    elif args.projects_command == "list":
+        _projects_list()
+    elif args.projects_command == "scan":
+        _projects_scan(args.root, depth=args.depth)
+    else:
+        print("Missing projects subcommand: add, remove, list, or scan", file=sys.stderr)
+        sys.exit(1)
+
+
+def _projects_add(source: str, *, name: str | None, ref: str | None, include_text_files: bool) -> None:
+    if _is_git_url(source):
+        if not source.startswith(("https://", "http://")):
+            print("Only https://, http://, or local directory paths are accepted.", file=sys.stderr)
+            sys.exit(1)
+    elif not Path(source).expanduser().is_dir():
+        print(f"Project path does not exist or is not a directory: {source}", file=sys.stderr)
+        sys.exit(1)
+    entry = add_project(source, name=name, ref=ref, include_text_files=include_text_files)
+    print(f"Added project: {entry.display_name} ({entry.source})")
+
+
+def _projects_list() -> None:
+    config = load_projects()
+    if not config.projects:
+        print("No projects registered. Use `semble projects add <path>` first.")
+        return
+    print(f"Projects ({len(config.projects)}):")
+    for entry in config.projects:
+        ref = f" @ {entry.ref}" if entry.ref else ""
+        text = " + text" if entry.include_text_files else ""
+        print(f"  {entry.display_name}: {entry.source}{ref}{text}")
+
+
+def _projects_scan(root_arg: str, *, depth: int) -> None:
+    root = Path(root_arg).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Scan root does not exist or is not a directory: {root_arg}", file=sys.stderr)
+        sys.exit(1)
+    repos = _scan_git_repos(root, max_depth=depth)
+    if not repos:
+        print("No git repositories found.")
+        return
+    for repo in repos:
+        entry = add_project(str(repo))
+        print(f"Added project: {entry.display_name} ({entry.source})")
+    print(f"Registered {len(repos)} projects.")
+
+
+def _scan_git_repos(root: Path, *, max_depth: int) -> list[Path]:
+    """Return git repositories under *root* up to *max_depth* directories deep."""
+    repos: list[Path] = []
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build"}
+
+    def _walk(directory: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        if (directory / ".git").is_dir():
+            repos.append(directory)
+            return
+        try:
+            children = sorted(directory.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if not child.is_dir() or child.name in skip_dirs or child.name.startswith("."):
+                continue
+            _walk(child, depth + 1)
+
+    _walk(root, 0)
+    return repos

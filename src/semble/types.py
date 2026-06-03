@@ -1,20 +1,12 @@
 import hashlib
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any, Protocol, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
 
 EmbeddingMatrix: TypeAlias = npt.NDArray[np.float32]
-
-
-class CallType(str, Enum):
-    """Call type for token-savings tracking."""
-
-    SEARCH = "search"
-    FIND_RELATED = "find_related"
 
 
 class Encoder(Protocol):
@@ -60,16 +52,10 @@ def chunk_id(chunk: "Chunk", namespace: str = "") -> str:
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
-    """A single search result with score and source."""
+    """A single search result with score and optional source-repo attribution."""
 
     chunk: Chunk
     score: float
-
-
-@dataclass(frozen=True, slots=True)
-class IndexStats:
-    """Statistics about the current index state."""
-
-    indexed_files: int = 0
-    total_chunks: int = 0
-    languages: dict[str, int] = field(default_factory=dict)
+    repo_id: str | None = None
+    repo_name: str | None = None
+    repo_source: str | None = None

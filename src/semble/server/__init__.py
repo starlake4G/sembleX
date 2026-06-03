@@ -1,3 +1,3 @@
-from semble.server.app import create_app
+from semble.server.indexer import GlobalIndex, IndexOutcome
 
-__all__ = ["create_app"]
+__all__ = ["GlobalIndex", "IndexOutcome"]

@@ -114,7 +114,7 @@ class MilvusVectorStore(VectorStore):
             if not ids:
                 return []
             quoted = ",".join(f'"{cid}"' for cid in ids)
-            filter_expr = f'{filter_expr} && chunk_id in [{quoted}]'
+            filter_expr = f"{filter_expr} && chunk_id in [{quoted}]"
         search_kwargs: dict[str, object] = {
             "collection_name": self._config.collection,
             "data": prepared.tolist(),
@@ -129,17 +129,54 @@ class MilvusVectorStore(VectorStore):
         hits: list[tuple[str, float]] = []
         first = results[0] if results else []
         for hit in first:
-            if isinstance(hit, dict):
-                entity = hit.get("entity", {})
-                cid = entity.get("chunk_id") or hit.get("id")
-                distance = float(hit.get("distance", 0.0))
-            else:
-                cid = getattr(hit, "id", None)
-                distance = float(getattr(hit, "distance", 0.0))
+            cid, _, distance = self._parse_hit(hit)
             if cid is None:
                 continue
-            hits.append((str(cid), self._similarity(distance)))
+            hits.append((cid, self._similarity(distance)))
         return hits
+
+    def query_global(
+        self,
+        vector: EmbeddingMatrix,
+        k: int,
+        exclude_namespace: str | None = None,
+    ) -> list[tuple[str, str, float]]:
+        """Search across all namespaces, returning ``[(chunk_id, namespace, similarity)]``."""
+        prepared = self._prepare_vectors(np.asarray(vector, dtype=np.float32))
+        search_kwargs: dict[str, object] = {
+            "collection_name": self._config.collection,
+            "data": prepared.tolist(),
+            "anns_field": self._config.vector_field,
+            "limit": k,
+            "output_fields": ["chunk_id", "namespace"],
+        }
+        if exclude_namespace is not None:
+            search_kwargs["filter"] = f'namespace != "{exclude_namespace}"'
+        if self._config.search_params:
+            search_kwargs["search_params"] = self._config.search_params
+        results = self._client.search(**search_kwargs)
+        hits: list[tuple[str, str, float]] = []
+        first = results[0] if results else []
+        for hit in first:
+            cid, namespace, distance = self._parse_hit(hit)
+            if cid is None:
+                continue
+            hits.append((cid, namespace or "", self._similarity(distance)))
+        return hits
+
+    @staticmethod
+    def _parse_hit(hit: object) -> tuple[str | None, str | None, float]:
+        """Extract ``(chunk_id, namespace, distance)`` from a Milvus hit (dict or object)."""
+        if isinstance(hit, dict):
+            entity = hit.get("entity", {})
+            cid = entity.get("chunk_id") or hit.get("id")
+            namespace = entity.get("namespace")
+            distance = float(hit.get("distance", 0.0))
+        else:
+            cid = getattr(hit, "id", None)
+            namespace = None
+            distance = float(getattr(hit, "distance", 0.0))
+        return (str(cid) if cid is not None else None, str(namespace) if namespace is not None else None, distance)
 
     def save(self, path: Path) -> None:
         # Milvus is the source of truth; nothing to dump.
@@ -154,7 +191,7 @@ class MilvusVectorStore(VectorStore):
             arr = arr.reshape(1, -1)
         if self._config.metric_type == "IP":
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
-            arr = arr / np.where(norms > 1e-9, norms, 1.0)
+            arr = (arr / np.where(norms > 1e-9, norms, 1.0)).astype(np.float32, copy=False)
         return arr
 
     def _similarity(self, distance: float) -> float:

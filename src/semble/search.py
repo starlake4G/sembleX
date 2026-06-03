@@ -1,116 +1,95 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from collections import defaultdict
+from dataclasses import dataclass
 
-from semble.ranking import resolve_alpha
+from semble.ranking import apply_query_boost, boost_multi_chunk_files, rerank_topk, resolve_alpha
 from semble.types import Chunk, SearchResult
-
-if TYPE_CHECKING:
-    from semble.interfaces import EmbeddingProvider, Reranker, SparseIndex, VectorStore
 
 _RRF_K = 60
 
 
-def _rrf_scores(scores: dict[Chunk, float]) -> dict[Chunk, float]:
-    if not scores:
-        return scores
-    ranked = sorted(scores, key=lambda c: -scores[c])
-    return {chunk: 1.0 / (_RRF_K + rank) for rank, chunk in enumerate(ranked, 1)}
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    """A retrieval candidate resolved to its chunk, source repo, and fused score."""
+
+    chunk_id: str
+    repo_id: str
+    repo_name: str
+    repo_source: str
+    chunk: Chunk
+    score: float
 
 
-def _search_semantic(
-    query: str,
-    model: "EmbeddingProvider",
-    semantic_index: "VectorStore",
-    namespace: str,
-    by_id: dict[str, Chunk],
+def _rrf(ranked_ids: list[str]) -> dict[str, float]:
+    """Reciprocal-rank-fusion weights for a ranked list of chunk ids."""
+    return {cid: 1.0 / (_RRF_K + rank) for rank, cid in enumerate(ranked_ids, 1)}
+
+
+def fuse_hybrid(
+    dense: list[tuple[str, float]],
+    sparse: list[tuple[str, float]],
+    alpha: float,
+) -> dict[str, float]:
+    """Fuse dense and sparse ranked lists by chunk_id using RRF + alpha blending."""
+    dense_rrf = _rrf([cid for cid, _ in dense])
+    sparse_rrf = _rrf([cid for cid, _ in sparse])
+    fused: dict[str, float] = {}
+    for cid in dense_rrf.keys() | sparse_rrf.keys():
+        fused[cid] = alpha * dense_rrf.get(cid, 0.0) + (1.0 - alpha) * sparse_rrf.get(cid, 0.0)
+    return fused
+
+
+def rank_candidates(
+    query: str | None,
+    candidates: list[Candidate],
     top_k: int,
-    selector_ids: Sequence[str] | None,
+    *,
+    apply_query_boosts: bool,
 ) -> list[SearchResult]:
-    query_embedding = model.encode([query])
-    hits = semantic_index.query(namespace, query_embedding, k=top_k, selector_ids=selector_ids)
-    return [
-        SearchResult(chunk=by_id[cid], score=float(score))
-        for cid, score in hits
-        if cid in by_id
-    ]
+    """Rank candidates by running the code-aware ranking per source repo, then merging.
 
+    Grouping by repo keeps file-coherence boosts and file-saturation penalties
+    repo-scoped (a ``src/main.py`` in repo A must not be conflated with one in
+    repo B), and avoids cross-repo collisions of equal ``Chunk`` objects.
 
-def _search_bm25(
-    query: str,
-    sparse_index: "SparseIndex",
-    by_id: dict[str, Chunk],
-    top_k: int,
-    selector_ids: Sequence[str] | None,
-) -> list[SearchResult]:
-    hits = sparse_index.query(query, k=top_k, selector_ids=selector_ids)
-    return [
-        SearchResult(chunk=by_id[cid], score=float(score))
-        for cid, score in hits
-        if cid in by_id
-    ]
+    :param query: The query string, or None for find_related (no query-text boosts).
+    :param candidates: Fused candidates with resolved chunks and repo attribution.
+    :param top_k: Number of merged results to return.
+    :param apply_query_boosts: Whether to apply symbol/stem query boosts (search only).
+    :return: Globally merged, ranked results with repo attribution.
+    """
+    if not candidates:
+        return []
 
+    by_repo: dict[str, list[Candidate]] = defaultdict(list)
+    for cand in candidates:
+        by_repo[cand.repo_id].append(cand)
 
-def search(
-    query: str,
-    model: "EmbeddingProvider",
-    semantic_index: "VectorStore",
-    sparse_index: "SparseIndex",
-    chunks: list[Chunk],
-    by_id: dict[str, Chunk],
-    top_k: int,
-    namespace: str,
-    alpha: float | None = None,
-    selector_ids: Sequence[str] | None = None,
-    rerank: bool = True,
-    reranker: "Reranker | None" = None,
-    coarse_k: int | None = None,
-) -> list[SearchResult]:
-    alpha_weight = resolve_alpha(query, alpha)
-    candidate_count = top_k * 5
-
-    semantic = _search_semantic(
-        query, model, semantic_index, namespace, by_id, candidate_count, selector_ids,
-    )
-    semantic_scores: dict[Chunk, float] = {result.chunk: result.score for result in semantic}
-
-    bm25_scores: dict[Chunk, float] = {}
-    for result in _search_bm25(query, sparse_index, by_id, candidate_count, selector_ids):
-        if result.score:
-            bm25_scores[result.chunk] = result.score
-
-    normalized_semantic = _rrf_scores(semantic_scores)
-    normalized_bm25 = _rrf_scores(bm25_scores)
-
-    all_candidates = sorted(
-        {*normalized_semantic, *normalized_bm25},
-        key=lambda c: c.start_line,
-    )
-    combined_scores: dict[Chunk, float] = {
-        chunk: alpha_weight * normalized_semantic.get(chunk, 0.0)
-        + (1.0 - alpha_weight) * normalized_bm25.get(chunk, 0.0)
-        for chunk in all_candidates
-    }
-
-    if rerank:
-        if reranker is not None:
-            ranked = reranker.rerank(
-                query,
-                combined_scores,
-                chunks,
-                top_k,
-                penalise_paths=alpha_weight < 1.0,
-                coarse_k=coarse_k,
+    merged: list[SearchResult] = []
+    for repo_id, repo_cands in by_repo.items():
+        repo_name = repo_cands[0].repo_name
+        repo_source = repo_cands[0].repo_source
+        scores: dict[Chunk, float] = {c.chunk: c.score for c in repo_cands}
+        if apply_query_boosts and query:
+            boost_multi_chunk_files(scores)
+            scores = apply_query_boost(scores, query, list(scores))
+        ranked = rerank_topk(scores, len(scores), penalise_paths=True)
+        for chunk, score in ranked:
+            merged.append(
+                SearchResult(
+                    chunk=chunk,
+                    score=score,
+                    repo_id=repo_id,
+                    repo_name=repo_name,
+                    repo_source=repo_source,
+                )
             )
-        else:
-            from semble.ranking import apply_query_boost, boost_multi_chunk_files, rerank_topk
 
-            boost_multi_chunk_files(combined_scores)
-            combined_scores = apply_query_boost(combined_scores, query, chunks)
-            ranked = rerank_topk(combined_scores, top_k, penalise_paths=alpha_weight < 1.0)
-    else:
-        sorted_by_score = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-        ranked = sorted_by_score[:top_k]
+    merged.sort(key=lambda r: -r.score)
+    return merged[:top_k]
 
-    return [SearchResult(chunk=chunk, score=score) for chunk, score in ranked]
+
+def alpha_for(query: str) -> float:
+    """Resolve the dense/sparse blend weight for *query* (symbol vs natural language)."""
+    return resolve_alpha(query, None)

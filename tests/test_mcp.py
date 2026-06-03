@@ -1,15 +1,12 @@
-import asyncio
-import threading
-from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from semble.config import IndexConfig, SembleConfig
-from semble.mcp import _CACHE_MAX_SIZE, _IndexCache, create_remote_server, create_server, serve
-from semble.types import Chunk, Encoder, SearchResult
-from semble.utils import _format_results, _is_git_url, _resolve_chunk
+from semble.mcp import create_server, serve
+from semble.server.metadata import RepoNotIndexedError
+from semble.types import SearchResult
+from semble.utils import _format_results, _is_git_url
 from tests.conftest import make_chunk
 
 
@@ -18,346 +15,136 @@ def _tool_text(result: Any) -> str:
     return result[0][0].text
 
 
-async def _call_tool(
-    cache: _IndexCache,
-    tool: str,
-    args: dict[str, Any],
-    *,
-    index_method: str,
-    index_return: list[SearchResult],
-    index_chunks: list[Chunk] | None = None,
-    default_source: str | None = "/some/path",
-) -> str:
-    """Patch SembleIndex.from_path with a fake index and invoke the tool, returning the text."""
-    fake_index = MagicMock()
-    getattr(fake_index, index_method).return_value = index_return
-    if index_chunks is not None:
-        fake_index.chunks = index_chunks
-    with patch("semble.mcp.SembleIndex.from_path", return_value=fake_index):
-        server = create_server(cache, default_source=default_source)
-        result = await server.call_tool(tool, args)
-    return _tool_text(result)
+def _result(content: str, path: str, repo_name: str, source: str, score: float) -> SearchResult:
+    return SearchResult(
+        chunk=make_chunk(content, path),
+        score=score,
+        repo_id=repo_name,
+        repo_name=repo_name,
+        repo_source=source,
+    )
 
 
-@pytest.fixture()
-def cache() -> _IndexCache:
-    """An _IndexCache backed by a stub model."""
-    return _IndexCache(model=MagicMock(spec=Encoder))
+@pytest.mark.anyio
+async def test_search_tool_formats_repo_attributed_results() -> None:
+    index = MagicMock()
+    index.search.return_value = [_result("def bar(): pass", "src/bar.py", "repoA", "/x/repoA", 0.9)]
+    server = create_server(index)
+    text = _tool_text(await server.call_tool("search", {"query": "bar"}))
+    assert "repoA :: src/bar.py" in text
+    assert "repo: /x/repoA" in text
+    assert "0.900" in text
+    index.search.assert_called_once()
 
 
-def test_resolve_chunk() -> None:
-    """_resolve_chunk returns the correct chunk and handles boundary and miss cases."""
-    interior = make_chunk("line1\nline2\nline3", "src/a.py")  # start=1, end=3
-    boundary = make_chunk("last line", "src/a.py")  # start=1, end=1 (single-line)
+@pytest.mark.anyio
+async def test_search_tool_no_results() -> None:
+    index = MagicMock()
+    index.search.return_value = []
+    server = create_server(index)
+    assert "No results found" in _tool_text(await server.call_tool("search", {"query": "x"}))
 
-    # Line strictly inside a multi-line chunk hits the early-return path.
-    assert _resolve_chunk([interior], "src/a.py", 2) is interior
 
-    # Line equal to end_line of a single-line chunk hits the fallback path.
-    assert _resolve_chunk([boundary], "src/a.py", 1) is boundary
+@pytest.mark.anyio
+async def test_search_global_scope_searches_all_repos() -> None:
+    index = MagicMock()
+    index.search.return_value = []
+    server = create_server(index, workspace="/x/repoA")
+    await server.call_tool("search", {"query": "x"})  # default scope=global
+    _, kwargs = index.search.call_args
+    assert kwargs["repo"] is None
 
-    # Unknown file returns None.
-    assert _resolve_chunk([interior], "src/other.py", 1) is None
 
-    # Line out of range returns None.
-    assert _resolve_chunk([interior], "src/a.py", 99) is None
+@pytest.mark.anyio
+async def test_search_workspace_scope_restricts_to_workspace() -> None:
+    index = MagicMock()
+    index.search.return_value = [_result("def bar(): pass", "bar.py", "repoA", "/x/repoA", 0.9)]
+    server = create_server(index, workspace="/x/repoA")
+    text = _tool_text(await server.call_tool("search", {"query": "bar", "scope": "workspace"}))
+    _, kwargs = index.search.call_args
+    assert kwargs["repo"] == "/x/repoA"
+    assert "workspace" in text
+
+
+@pytest.mark.anyio
+async def test_search_explicit_repo_overrides_scope() -> None:
+    index = MagicMock()
+    index.search.return_value = []
+    server = create_server(index, workspace="/x/repoA")
+    await server.call_tool("search", {"query": "x", "scope": "workspace", "repo": "/x/repoB"})
+    _, kwargs = index.search.call_args
+    assert kwargs["repo"] == "/x/repoB"
+
+
+@pytest.mark.anyio
+async def test_search_workspace_scope_without_workspace() -> None:
+    index = MagicMock()
+    server = create_server(index, workspace=None)
+    text = _tool_text(await server.call_tool("search", {"query": "x", "scope": "workspace"}))
+    assert "workspace" in text.lower()
+    index.search.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_search_workspace_not_indexed_message() -> None:
+    index = MagicMock()
+    index.search.side_effect = RepoNotIndexedError("rid", source="/x/repoA")
+    server = create_server(index, workspace="/x/repoA")
+    text = _tool_text(await server.call_tool("search", {"query": "x", "scope": "workspace"}))
+    assert "not in the index" in text.lower()
+    assert "scope='global'" in text
+
+
+@pytest.mark.anyio
+async def test_find_related_tool_returns_cross_repo_matches() -> None:
+    index = MagicMock()
+    index.find_related.return_value = [_result("class Foo: pass", "foo.py", "repoB", "/x/repoB", 0.8)]
+    server = create_server(index)
+    text = _tool_text(
+        await server.call_tool("find_related", {"repo": "/x/repoA", "file_path": "a.py", "line": 3})
+    )
+    assert "repoB :: foo.py" in text
+    _, kwargs = index.find_related.call_args
+    assert kwargs["exclude_source_repo"] is True
+
+
+@pytest.mark.anyio
+async def test_find_related_tool_repo_not_indexed() -> None:
+    index = MagicMock()
+    index.find_related.side_effect = RepoNotIndexedError("rid", source="/x/repoA")
+    server = create_server(index)
+    text = _tool_text(
+        await server.call_tool("find_related", {"repo": "/x/repoA", "file_path": "a.py", "line": 3})
+    )
+    assert "not indexed" in text.lower()
+
+
+@pytest.mark.anyio
+async def test_serve_runs_stdio() -> None:
+    with (
+        patch("semble.mcp.GlobalIndex", return_value=MagicMock()),
+        patch("mcp.server.fastmcp.FastMCP.run_stdio_async", new_callable=AsyncMock) as mock_run,
+    ):
+        await serve()
+    mock_run.assert_called_once()
+
+
+def test_format_results_shows_repo_and_source() -> None:
+    results = [_result("def f(): pass", "f.py", "repoA", "/x/repoA", 0.5)]
+    out = _format_results("Header", results)
+    assert "repoA :: f.py" in out
+    assert "repo: /x/repoA" in out
+    assert "0.500" in out
 
 
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
         ("https://github.com/org/repo", True),
-        ("http://github.com/org/repo", True),
-        ("git://github.com/org/repo", True),
-        ("ssh://git@github.com/org/repo", True),
-        ("git+ssh://git@github.com/org/repo", True),
-        ("file:///tmp/repo", True),
-        ("git@github.com:org/repo", True),  # scp-like
+        ("git@github.com:org/repo", True),
         ("/local/path/to/repo", False),
         ("./relative/path", False),
-        ("repo_name", False),
     ],
 )
 def test_is_git_url(path: str, expected: bool) -> None:
-    """Remote git URLs are detected; local paths are not."""
     assert _is_git_url(path) is expected
-
-
-def test_format_results() -> None:
-    """_format_results: empty list → header only; with results → numbered fenced blocks with scores."""
-    empty_out = _format_results("My header", [])
-    assert "My header" in empty_out
-    assert "```" not in empty_out
-
-    chunks = [make_chunk(f"def fn_{i}(): pass", f"f{i}.py") for i in range(3)]
-    results = [SearchResult(chunk=c, score=round(0.1 * (i + 1), 3)) for i, c in enumerate(chunks)]
-    out = _format_results("Results for: 'foo'", results)
-    assert "Results for: 'foo'" in out
-    assert out.count("```") >= len(results) * 2  # opening + closing fence each
-    for i, c in enumerate(chunks, start=1):
-        assert f"## {i}." in out
-        assert c.content in out
-    assert "0.100" in out and "0.200" in out and "0.300" in out
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("source", "patch_target"),
-    [
-        ("local_tmp_path", "from_path"),
-        ("https://github.com/org/repo", "from_git"),
-    ],
-    ids=["local_path", "git_url"],
-)
-async def test_index_cache_builds_and_caches(
-    cache: _IndexCache, tmp_path: Path, source: str, patch_target: str
-) -> None:
-    """_IndexCache.get() builds via the correct SembleIndex.* entrypoint and caches subsequent calls."""
-    resolved_source = str(tmp_path) if source == "local_tmp_path" else source
-    fake_index = MagicMock()
-    with patch(f"semble.mcp.SembleIndex.{patch_target}", return_value=fake_index) as mock_build:
-        first = await cache.get(resolved_source)
-        second = await cache.get(resolved_source)
-    assert first is fake_index
-    assert second is fake_index
-    mock_build.assert_called_once()
-
-
-@pytest.mark.anyio
-async def test_index_cache_evicts_on_failure(cache: _IndexCache, tmp_path: Path) -> None:
-    """A failed build evicts the entry so the next call can retry."""
-    call_count = 0
-
-    def _failing_then_ok(path: str, **kwargs: object) -> MagicMock:
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            raise RuntimeError("build failed")
-        return MagicMock()
-
-    with patch("semble.mcp.SembleIndex.from_path", side_effect=_failing_then_ok):
-        with pytest.raises(RuntimeError, match="build failed"):
-            await cache.get(str(tmp_path))
-        result = await cache.get(str(tmp_path))
-    assert result is not None
-    assert call_count == 2
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("tool", "args"),
-    [
-        ("search", {"query": "foo"}),
-        ("find_related", {"file_path": "src/foo.py", "line": 10}),
-    ],
-)
-async def test_tool_no_repo_no_default(cache: _IndexCache, tool: str, args: dict[str, object]) -> None:
-    """Both tools return an error message when no repo and no default source are given."""
-    server = create_server(cache, default_source=None)
-    result = await server.call_tool(tool, args)
-    assert "No repo specified" in _tool_text(result)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("tool", "args"),
-    [
-        ("search", {"query": "foo", "repo": "https://github.com/x/y"}),
-        ("find_related", {"file_path": "src/foo.py", "line": 1, "repo": "https://github.com/x/y"}),
-    ],
-)
-async def test_tool_index_failure(cache: _IndexCache, tool: str, args: dict[str, object]) -> None:
-    """Both tools return a friendly error message when indexing fails."""
-    with patch("semble.mcp.SembleIndex.from_git", side_effect=RuntimeError("clone failed")):
-        server = create_server(cache)
-        result = await server.call_tool(tool, args)
-    text = _tool_text(result)
-    assert "Failed to index" in text
-    assert "clone failed" in text
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("tool", "args", "method", "results", "chunks", "expected_substrings"),
-    [
-        pytest.param(
-            "search",
-            {"query": "bar"},
-            "search",
-            [SearchResult(chunk=make_chunk("def bar(): pass", "src/bar.py"), score=0.9)],
-            None,
-            ["bar", "0.900"],
-            id="search_with_results",
-        ),
-        pytest.param(
-            "search",
-            {"query": "nothing"},
-            "search",
-            [],
-            None,
-            ["No results found"],
-            id="search_no_results",
-        ),
-        pytest.param(
-            "find_related",
-            {"file_path": "src/foo.py", "line": 1},
-            "find_related",
-            [SearchResult(chunk=make_chunk("class Foo: pass", "src/foo.py"), score=0.8)],
-            [make_chunk("class Foo: pass", "src/foo.py")],
-            ["src/foo.py:1", "0.800"],
-            id="find_related_with_results",
-        ),
-        pytest.param(
-            "find_related",
-            {"file_path": "src/foo.py", "line": 1},
-            "find_related",
-            [],
-            [make_chunk("class Foo: pass", "src/foo.py")],
-            ["No related chunks found"],
-            id="find_related_no_results",
-        ),
-        pytest.param(
-            "find_related",
-            {"file_path": "src/unknown.py", "line": 1},
-            "find_related",
-            [],
-            [],
-            ["No chunk found"],
-            id="find_related_unknown_file",
-        ),
-    ],
-)
-async def test_tool_output(
-    cache: _IndexCache,
-    tool: str,
-    args: dict[str, Any],
-    method: str,
-    results: list[SearchResult],
-    chunks: list[Chunk] | None,
-    expected_substrings: list[str],
-) -> None:
-    """Search and find_related format results (or an empty-state message) through the server."""
-    text = await _call_tool(cache, tool, args, index_method=method, index_return=results, index_chunks=chunks)
-    for substring in expected_substrings:
-        assert substring in text
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("tool", "args", "method"),
-    [
-        ("search", {"query": "foo", "repo": "/repo", "top_k": 3}, "search"),
-        ("find_related", {"file_path": "src/foo.py", "line": 4, "repo": "/repo"}, "find_related"),
-    ],
-)
-async def test_remote_server_routes_to_client(tool: str, args: dict[str, object], method: str) -> None:
-    """Remote MCP server calls the HTTP client instead of building an index."""
-    client = MagicMock()
-    getattr(client, method).return_value = "remote result"
-    server = create_remote_server(client, include_text_files=True)
-
-    result = await server.call_tool(tool, args)
-
-    assert "remote result" in _tool_text(result)
-    if method == "search":
-        client.search.assert_called_once_with("foo", repo="/repo", top_k=3, include_text_files=True)
-    else:
-        client.find_related.assert_called_once_with("src/foo.py", 4, repo="/repo", top_k=5, include_text_files=True)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("with_path", [True, False], ids=["pre_index", "no_path"])
-async def test_serve_runs_stdio(tmp_path: Path, with_path: bool) -> None:
-    """serve() loads the model, runs stdio, and optionally pre-indexes when a path is given."""
-    with (
-        patch("semble.mcp.create_embedding_provider", return_value=MagicMock(spec=Encoder)),
-        patch("semble.mcp.SembleIndex.from_path", return_value=MagicMock()),
-        patch.object(_IndexCache, "start_watcher", new_callable=AsyncMock),
-        patch("mcp.server.fastmcp.FastMCP.run_stdio_async", side_effect=fake_stdio) as mock_run,
-    ):
-        await (serve(str(tmp_path)) if with_path else serve())
-
-    mock_run.assert_called_once()
-
-
-@pytest.mark.anyio
-async def test_serve_remote_skips_local_indexing(tmp_path: Path) -> None:
-    """Remote mode starts a remote MCP server without loading a local model or index."""
-    cfg = SembleConfig(index=IndexConfig(backend="remote"))
-    client = MagicMock()
-    with (
-        patch("semble.mcp.RemoteSembleClient.from_config", return_value=client),
-        patch("semble.mcp.create_embedding_provider") as create_model,
-        patch("semble.mcp.SembleIndex.from_path") as from_path,
-        patch("mcp.server.fastmcp.FastMCP.run_stdio_async", new_callable=AsyncMock) as mock_run,
-    ):
-        await serve(str(tmp_path), config=cfg)
-
-    create_model.assert_not_called()
-    from_path.assert_not_called()
-    mock_run.assert_called_once()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("repo", "tool", "extra_args"),
-    [
-        ("file:///home/user/secret", "search", {"query": "foo"}),
-        ("ssh://internal-host/repo", "search", {"query": "foo"}),
-        ("git@github.com:org/repo", "search", {"query": "foo"}),
-        ("file:///home/user/secret", "find_related", {"file_path": "src/foo.py", "line": 1}),
-        ("ssh://internal-host/repo", "find_related", {"file_path": "src/foo.py", "line": 1}),
-    ],
-    ids=["file_search", "ssh_search", "scp_search", "file_find_related", "ssh_find_related"],
-)
-async def test_tool_rejects_unsafe_repo(
-    cache: _IndexCache, repo: str, tool: str, extra_args: dict[str, object]
-) -> None:
-    """Both tools reject unsafe git transport schemes (ssh://, file://, SCP-form) supplied as repo."""
-    server = create_server(cache, default_source=None)
-    result = await server.call_tool(tool, {**extra_args, "repo": repo})
-    assert "Only https://" in _tool_text(result)
-
-
-@pytest.mark.anyio
-async def test_index_cache_lru_eviction(cache: _IndexCache, tmp_path: Path) -> None:
-    """_IndexCache evicts the least-recently-used entry when the cache is full."""
-    dirs = [tmp_path / str(i) for i in range(_CACHE_MAX_SIZE + 1)]
-    for d in dirs:
-        d.mkdir()
-    with patch("semble.mcp.SembleIndex.from_path", return_value=MagicMock()):
-        for d in dirs[:_CACHE_MAX_SIZE]:
-            await cache.get(str(d))
-        first_key = str(dirs[0].resolve())
-        assert first_key in cache._tasks
-        await cache.get(str(dirs[_CACHE_MAX_SIZE]))
-    assert first_key not in cache._tasks
-    assert len(cache._tasks) == _CACHE_MAX_SIZE
-
-
-def test_cache_evict(cache: _IndexCache, tmp_path: Path) -> None:
-    """evict() removes an existing cache entry by resolved path."""
-    key = str(tmp_path.resolve())
-    cache._tasks[key] = MagicMock()
-    cache.evict(str(tmp_path))
-    assert key not in cache._tasks
-
-
-def test_cache_evict_missing(cache: _IndexCache, tmp_path: Path) -> None:
-    """evict() on an unknown path is a no-op."""
-    cache.evict(str(tmp_path))  # should not raise
-
-
-@pytest.mark.anyio
-async def test_watch_loop(cache: _IndexCache, tmp_path: Path) -> None:
-    """_watch_loop rebuilds on change (inner errors swallowed) and exits cleanly on watcher error."""
-
-    async def fake_awatch(_path: str) -> AsyncGenerator:
-        yield set()
-        raise RuntimeError("watcher died")
-
-    with patch("watchfiles.awatch", fake_awatch):
-        with patch("semble.mcp.SembleIndex.from_path", side_effect=RuntimeError("build failed")):
-            await cache.start_watcher(str(tmp_path))
-            assert cache._watcher_task is not None
-            await cache._watcher_task

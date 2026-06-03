@@ -163,6 +163,39 @@ class MetadataStore:
         ).fetchall()
         return {str(row["chunk_id"]): self._chunk_from_row(row) for row in rows}
 
+    def get_chunks_with_repo(self, chunk_ids: list[str]) -> dict[str, tuple[str, Chunk]]:
+        """Return ``{chunk_id: (repo_id, Chunk)}`` for the given ids."""
+        if not chunk_ids:
+            return {}
+        placeholders = ",".join("?" for _ in chunk_ids)
+        rows = self._conn.execute(
+            f"select * from chunks where chunk_id in ({placeholders})",
+            chunk_ids,
+        ).fetchall()
+        return {str(row["chunk_id"]): (str(row["repo_id"]), self._chunk_from_row(row)) for row in rows}
+
+    def chunk_ids(self, repo_id: str) -> list[str]:
+        """Return all chunk ids belonging to *repo_id*."""
+        rows = self._conn.execute("select chunk_id from chunks where repo_id = ?", (repo_id,)).fetchall()
+        return [str(row["chunk_id"]) for row in rows]
+
+    def repo_sources(self) -> dict[str, str]:
+        """Return ``{repo_id: source}`` for all indexed repos."""
+        rows = self._conn.execute("select repo_id, source from repos").fetchall()
+        return {str(row["repo_id"]): str(row["source"]) for row in rows}
+
+    def repo_source_paths(self) -> dict[str, str]:
+        """Return ``{repo_id: source_path}`` (resolved local path) for all indexed repos."""
+        rows = self._conn.execute("select repo_id, source_path from repos").fetchall()
+        return {str(row["repo_id"]): str(row["source_path"]) for row in rows}
+
+    def iter_all_chunks(self) -> list[tuple[str, str, Chunk]]:
+        """Return ``[(chunk_id, repo_id, Chunk)]`` for every indexed chunk (for BM25 rebuild)."""
+        rows = self._conn.execute(
+            "select * from chunks order by repo_id, file_path, start_line, end_line, chunk_id"
+        ).fetchall()
+        return [(str(row["chunk_id"]), str(row["repo_id"]), self._chunk_from_row(row)) for row in rows]
+
     def all_chunks(self, repo_id: str) -> list[tuple[str, Chunk]]:
         """Return ``[(chunk_id, Chunk)]`` for *repo_id* in deterministic insertion order."""
         rows = self._conn.execute(

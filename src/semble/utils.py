@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from semble.types import Chunk, SearchResult
 
@@ -11,6 +12,13 @@ _SCP_GIT_URL_RE = re.compile(r"^[\w.-]+@[\w.-]+:(?!/)")
 def _is_git_url(path: str) -> bool:
     """Return True if path looks like a remote git URL rather than a local path."""
     return path.startswith(_GIT_URL_SCHEMES) or _SCP_GIT_URL_RE.match(path) is not None
+
+
+def display_name_for(source: str) -> str:
+    """Human-friendly repo name from a local path or git URL."""
+    if _is_git_url(source):
+        return source.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or source
+    return Path(source).name or source
 
 
 def _resolve_chunk(chunks: list[Chunk], file_path: str, line: int) -> Chunk | None:
@@ -30,10 +38,13 @@ def _resolve_chunk(chunks: list[Chunk], file_path: str, line: int) -> Chunk | No
 
 
 def _format_results(header: str, results: list[SearchResult]) -> str:
-    """Render SearchResult objects as numbered, fenced code blocks."""
+    """Render SearchResult objects as numbered, fenced code blocks with repo attribution."""
     lines: list[str] = [header, ""]
     for i, r in enumerate(results, 1):
-        lines.append(f"## {i}. {r.chunk.location}  [score={r.score:.3f}]")
+        prefix = f"{r.repo_name} :: " if r.repo_name else ""
+        lines.append(f"## {i}. {prefix}{r.chunk.location}  [score={r.score:.3f}]")
+        if r.repo_source:
+            lines.append(f"repo: {r.repo_source}")
         lines.append("```")
         lines.append(r.chunk.content.strip())
         lines.append("```")
