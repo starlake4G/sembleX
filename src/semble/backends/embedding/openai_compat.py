@@ -12,6 +12,14 @@ from semble.interfaces import EmbeddingFailure, EmbeddingMatrix, EmbeddingProvid
 
 logger = logging.getLogger(__name__)
 
+# Headroom kept below the model's hard context limit. The local token estimate
+# (tiktoken cl100k_base, or a chars-based heuristic) rarely matches the serving
+# tokenizer exactly, and the server may add special tokens (BOS/EOS). Without a
+# margin, a text estimated at exactly the limit can overflow by a few tokens and
+# get rejected with HTTP 400. 5% + a small fixed reserve absorbs that drift.
+_CONTEXT_SAFETY_RATIO = 0.95
+_CONTEXT_RESERVE_TOKENS = 16
+
 
 def _token_counter(model: str) -> Callable[[str], int]:
     try:
@@ -46,6 +54,8 @@ class OpenAICompatEmbedding(EmbeddingProvider):
         self._max_retries = max_retries
         self._max_concurrent = max_concurrent
         self._max_context_tokens = max_context_tokens
+        # Effective truncation budget: stay safely under the model's hard limit.
+        self._token_budget = max(1, int(max_context_tokens * _CONTEXT_SAFETY_RATIO) - _CONTEXT_RESERVE_TOKENS)
         self._count_tokens = _token_counter(model)
         self._dim_lock = threading.Lock()
 
@@ -133,15 +143,23 @@ class OpenAICompatEmbedding(EmbeddingProvider):
         return (arr / norms).astype(np.float32, copy=False)
 
     def _truncate(self, text: str) -> str:
-        if self._count_tokens(text) <= self._max_context_tokens:
+        budget = self._token_budget
+        if self._count_tokens(text) <= budget:
             return text
         lo, hi = 1, len(text)
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self._count_tokens(text[:mid]) <= self._max_context_tokens:
+            if self._count_tokens(text[:mid]) <= budget:
                 lo = mid
             else:
                 hi = mid - 1
+        logger.warning(
+            "Truncated oversized input from ~%d to ~%d tokens (budget %d, model limit %d)",
+            self._count_tokens(text),
+            self._count_tokens(text[:lo]),
+            budget,
+            self._max_context_tokens,
+        )
         return text[:lo]
 
     def _encode_single(self, text: str) -> list[float] | None:
