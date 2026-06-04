@@ -106,12 +106,20 @@ def create_server(index: GlobalIndex, *, workspace: str | None = None) -> FastMC
 async def serve(config: SembleConfig | None = None, *, workspace: str | None = None) -> None:
     """Run the Semble cross-repo MCP server over stdio.
 
+    Connects to the shared warm-index kernel (auto-spawning it on demand) so the
+    MCP server and every CLI invocation share one warm ``GlobalIndex`` instead of
+    each loading their own. Falls back to a cold in-process index if the kernel is
+    disabled or unreachable. The ``KernelClient`` exposes the same
+    ``search``/``find_related`` interface ``create_server`` expects.
+
     :param config: Semble configuration (defaults applied when omitted).
     :param workspace: Directory used for ``scope="workspace"`` searches; defaults to
         the process launch directory, which MCP clients set to the active project.
     """
+    from semble.server.kernel import connect_or_spawn
+
     cfg = config or SembleConfig()
     workspace = workspace or str(Path.cwd())
-    index = await asyncio.to_thread(GlobalIndex, cfg)
+    index = await asyncio.to_thread(connect_or_spawn, cfg)
     server = create_server(index, workspace=workspace)
     await server.run_stdio_async()

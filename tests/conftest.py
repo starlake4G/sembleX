@@ -21,6 +21,18 @@ def make_chunk(content: str, file_path: str = "src/module.py") -> Chunk:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_kernel_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never spawn the shared kernel daemon during tests.
+
+    ``connect_or_spawn`` would otherwise auto-launch a detached ``semble kernel``
+    that loads the real global index (gigabytes of BM25) using the developer's
+    prod config — running the suite could OOM the machine. This guard forces the
+    cold/in-process path; tests that exercise the CLI/MCP mock the backend anyway.
+    """
+    monkeypatch.setenv("SEMBLE_NO_KERNEL", "1")
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     """Run async tests on asyncio; trio is not a test dependency."""

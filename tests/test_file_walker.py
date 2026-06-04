@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from semble.index.file_walker import walk_files
+from semble.index.file_walker import looks_binary, looks_minified, walk_files
 
 
 def _touch(path: Path, content: str = "x = 1\n") -> None:
@@ -175,3 +175,40 @@ def test_walk_files_skips_symlinks(tmp_path: Path) -> None:
     # Symlink-based paths are absent
     assert "wrapper/src/linked/mod.py" not in found
     assert "link_to_original.py" not in found
+
+
+def test_walk_files_prunes_vendored_dirs(tmp_path: Path) -> None:
+    """Vendored/third-party dirs are pruned alongside node_modules."""
+    _touch(tmp_path / "src" / "app.js")
+    _touch(tmp_path / "vendor" / "lib.js")
+    _touch(tmp_path / "third_party" / "dep.js")
+    _touch(tmp_path / "libs" / "monaco" / "editor.js")
+    _touch(tmp_path / "bower_components" / "jq" / "jquery.js")
+
+    found = {p.relative_to(tmp_path).as_posix() for p in walk_files(tmp_path, [".js"])}
+    assert found == {"src/app.js"}, found
+
+
+def test_looks_binary() -> None:
+    """NUL bytes or a high replacement-char ratio mark content as binary."""
+    # Real source is never binary.
+    assert looks_binary("def foo():\n    return 1\n" * 50) is False
+    assert looks_binary("") is False
+    # An embedded NUL (decoded pickle/exe) is the classic binary signal.
+    assert looks_binary("PK\x03\x04\x00\x00stuff") is True
+    # JFIF/Exit image bytes decoded with errors='replace' are mostly U+FFFD.
+    jpg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF" + bytes(range(128, 256)) * 4
+    assert looks_binary(jpg_bytes.decode("utf-8", errors="replace")) is True
+
+
+def test_looks_minified() -> None:
+    """Minified/bundled assets are detected by name or huge average line length."""
+    # Real multi-line source (even long register headers) is not minified.
+    register_header = "".join(f"#define REG_{i} 0x{i * 4:08x}\n" for i in range(2000))
+    assert looks_minified("stm32f103xg.h", register_header) is False
+    assert looks_minified("foo.py", "x = 1\n" * 100) is False
+    # A .min. filename is enough.
+    assert looks_minified("xlsx.full.min.js", "var a=1;\nvar b=2;\n") is True
+    # A bundle packed onto one giant line is caught by content even without .min.
+    one_liner = "var d=[" + ",".join(str(i) for i in range(20_000)) + "];"
+    assert looks_minified("bundle.js", one_liner) is True

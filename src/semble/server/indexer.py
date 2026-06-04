@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from semble.backends.sparse import IncrementalSparseIndex
 from semble.backends.vector_store.milvus_store import MilvusVectorStore
 from semble.chunking import chunk_source
 from semble.config import SembleConfig
-from semble.index.file_walker import walk_files
+from semble.index.file_walker import looks_binary, looks_minified, walk_files
 from semble.index.files import detect_language, get_extensions
 from semble.interfaces import EmbeddingFailure
 from semble.search import Candidate, alpha_for, fuse_hybrid, rank_candidates
@@ -345,40 +346,78 @@ class GlobalIndex:
         source_path: Path,
         include_text_files: bool,
     ) -> tuple[list[Chunk], list[str]]:
+        """Embed and store a repo's chunks as a producer/embed-workers/writer pipeline.
+
+        Three stages run concurrently so the embed endpoint never idles:
+
+        * **producer** — this thread walks files and runs tree-sitter (a C extension that
+          releases the GIL), accumulating ``embed_batch_size`` chunks per batch;
+        * **embed workers** — a pool of ``embed_workers`` threads each send one batch as an
+          HTTP request (network wait + Rust tokenizer truncation, both GIL-free), giving
+          up to ``embed_workers`` concurrent in-flight requests;
+        * **writer** — Milvus add + SQLite insert, serialized under one lock (SQLite needs
+          a single writer) and overlapped with the next parse/embed.
+
+        A bounded semaphore caps in-flight batches so memory stays flat regardless of how
+        fast the producer runs. Result order is not preserved, which is fine: the caller
+        only needs the surviving chunks/ids as a set for the BM25 index and the count.
+        """
+        workers = max(1, self._config.indexing.embed_workers)
+        # Cap submitted-but-unfinished batches; backpressure blocks the producer here.
+        inflight = threading.BoundedSemaphore(workers * 2)
+        write_lock = threading.Lock()
         kept_chunks: list[Chunk] = []
         kept_ids: list[str] = []
-        batch: list[StoredChunk] = []
-        for chunk in self._iter_chunks(source_path, include_text_files):
-            batch.append(self._stored_chunk(repo_id, chunk))
-            if len(batch) >= self._config.indexing.embed_batch_size:
-                kc, kids = self._flush_batch(repo_id, batch)
-                kept_chunks.extend(kc)
-                kept_ids.extend(kids)
-                batch.clear()
-        if batch:
-            kc, kids = self._flush_batch(repo_id, batch)
-            kept_chunks.extend(kc)
-            kept_ids.extend(kids)
+
+        def embed_and_store(batch: list[StoredChunk]) -> None:
+            try:
+                survivors, vectors = self._embed_batch(batch)
+                if not survivors:
+                    return
+                ids = [s.chunk_id for s in survivors]
+                with write_lock:
+                    self._vector_store.add(repo_id, ids, vectors)
+                    self._metadata.insert_chunks(repo_id, survivors)
+                    kept_chunks.extend(s.chunk for s in survivors)
+                    kept_ids.extend(ids)
+            finally:
+                inflight.release()
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed") as executor:
+            batch: list[StoredChunk] = []
+            for chunk in self._iter_chunks(source_path, include_text_files):
+                batch.append(self._stored_chunk(repo_id, chunk))
+                if len(batch) >= self._config.indexing.embed_batch_size:
+                    inflight.acquire()
+                    futures.append(executor.submit(embed_and_store, batch))
+                    batch = []
+            if batch:
+                inflight.acquire()
+                futures.append(executor.submit(embed_and_store, batch))
+        # Surface any unexpected worker exception (EmbeddingFailure is handled in-worker).
+        for future in futures:
+            future.result()
         return kept_chunks, kept_ids
 
-    def _flush_batch(self, repo_id: str, batch: Sequence[StoredChunk]) -> tuple[list[Chunk], list[str]]:
+    def _embed_batch(self, batch: Sequence[StoredChunk]) -> tuple[list[StoredChunk], np.ndarray]:
+        """Embed one batch, returning the chunks that survived and their vectors.
+
+        Per-item failures are tolerated via :class:`EmbeddingFailure`'s partial result; a
+        fully failed batch returns ``([], empty)`` so the caller drops it.
+        """
         texts = [stored.chunk.content for stored in batch]
         try:
             vectors = np.asarray(self._model.encode(texts), dtype=np.float32)
-            survivors = list(batch)
+            return list(batch), vectors
         except EmbeddingFailure as exc:
             failed = set(exc.failed_indices)
             survivors = [s for i, s in enumerate(batch) if i not in failed]
             if exc.partial is None or not survivors:
                 logger.warning("Batch fully failed; dropping %d chunks", len(batch))
-                return [], []
-            vectors = np.asarray(exc.partial, dtype=np.float32)
+                return [], np.empty((0, self._model.dim), dtype=np.float32)
             logger.warning("Batch partially failed; dropped %d/%d chunks", len(failed), len(batch))
-
-        ids = [s.chunk_id for s in survivors]
-        self._vector_store.add(repo_id, ids, vectors)
-        self._metadata.insert_chunks(repo_id, survivors)
-        return [s.chunk for s in survivors], ids
+            return survivors, np.asarray(exc.partial, dtype=np.float32)
 
     def _iter_chunks(self, source_path: Path, include_text_files: bool) -> Iterator[Chunk]:
         extensions = get_extensions(include_text_files, None)
@@ -388,8 +427,19 @@ class GlobalIndex:
                     continue
                 source = file_path.read_text(encoding="utf-8", errors="replace")
                 relative_path = file_path.relative_to(source_path).as_posix()
+                # Skip binary files dragged in by a .gitignore negation (images,
+                # pickles) and minified/bundled assets — both are byte soup that
+                # adds hundreds of meaningless chunks and pollutes search.
+                if looks_binary(source) or looks_minified(relative_path, source):
+                    logger.debug("Skipping non-source file: %s", relative_path)
+                    continue
                 language = detect_language(file_path)
-                yield from chunk_source(source, relative_path, language)
+                yield from chunk_source(
+                    source,
+                    relative_path,
+                    language,
+                    max_chunk_chars=self._config.indexing.max_chunk_chars,
+                )
 
     def _prepare_source(self, repo: str, *, ref: str | None, force: bool) -> tuple[Path, str | None]:
         if _is_git_url(repo):

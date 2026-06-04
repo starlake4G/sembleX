@@ -30,8 +30,57 @@ _DEFAULT_IGNORED_DIRS: frozenset[str] = frozenset(
         "dist/",
         "build/",
         ".eggs/",
+        # Vendored / third-party code: their internals pollute cross-repo search
+        # results and waste embeddings (we want *your* code, not bundled libs).
+        "vendor/",
+        "third_party/",
+        "libs/",
+        "bower_components/",
     }
 )
+
+# Binary/minified detection thresholds (content-level skips applied by the
+# indexer on already-read file content; kept here so all skip rules live
+# together). These catch noise that the extension/dir filters can't: binary
+# files dragged in by a .gitignore negation (e.g. an image under data/), and
+# minified/bundled assets (xlsx.full.min.js, swagger-ui-bundle.js, ...) whose
+# byte soup adds hundreds of meaningless chunks.
+_BINARY_SNIFF_BYTES = 8192
+_BINARY_REPLACEMENT_RATIO = 0.1
+_MINIFIED_SAMPLE_CHARS = 65536
+_MINIFIED_AVG_LINE_LEN = 2000
+
+
+def looks_binary(text: str) -> bool:
+    r"""Heuristically decide whether decoded file content is really binary.
+
+    ``text`` is read with ``errors="replace"``, so invalid bytes survive as the
+    U+FFFD replacement char and embedded NULs survive as ``\\x00``. A NUL byte is
+    the classic git binary signal; a high replacement-char ratio means the bytes
+    were not valid UTF-8 (image, pickle, archive, ...).
+    """
+    sample = text[:_BINARY_SNIFF_BYTES]
+    if not sample:
+        return False
+    if "\x00" in sample:
+        return True
+    return sample.count("�") / len(sample) > _BINARY_REPLACEMENT_RATIO
+
+
+def looks_minified(file_name: str, text: str) -> bool:
+    """Heuristically decide whether content is a minified/bundled asset.
+
+    Two signals: a ``.min.`` filename, or a very large average line length —
+    minified/bundled files pack everything onto a few enormous lines, while
+    real source (including big register-map headers) keeps short lines.
+    """
+    if ".min." in file_name.lower():
+        return True
+    sample = text[:_MINIFIED_SAMPLE_CHARS]
+    if not sample:
+        return False
+    lines = sample.count("\n") + 1
+    return len(sample) / lines > _MINIFIED_AVG_LINE_LEN
 
 
 def _load_ignore_for_dir(directory: Path) -> GitIgnoreSpec | None:

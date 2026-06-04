@@ -25,7 +25,7 @@ def test_search_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     fake = MagicMock()
     fake.search.return_value = [_result("def foo(): pass", "src/foo.py", "repoA", "/x/repoA", 0.9)]
     monkeypatch.setattr(sys, "argv", ["semble", "search", "foo"])
-    with patch("semble.cli._build_index", return_value=fake):
+    with patch("semble.cli._query_backend", return_value=fake):
         main()
     out = capsys.readouterr().out
     assert "repoA :: src/foo.py" in out
@@ -36,7 +36,7 @@ def test_search_no_results(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Captu
     fake = MagicMock()
     fake.search.return_value = []
     monkeypatch.setattr(sys, "argv", ["semble", "search", "nothing"])
-    with patch("semble.cli._build_index", return_value=fake):
+    with patch("semble.cli._query_backend", return_value=fake):
         main()
     assert "No results found" in capsys.readouterr().out
 
@@ -45,7 +45,7 @@ def test_find_related_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Ca
     fake = MagicMock()
     fake.find_related.return_value = [_result("class Bar: pass", "src/bar.py", "repoB", "/y", 0.8)]
     monkeypatch.setattr(sys, "argv", ["semble", "find-related", "/y", "src/bar.py", "1"])
-    with patch("semble.cli._build_index", return_value=fake):
+    with patch("semble.cli._query_backend", return_value=fake):
         main()
     out = capsys.readouterr().out
     assert "src/bar.py" in out
@@ -84,7 +84,7 @@ def test_status_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
         "milvus": "http://x", "core_dir": "/c", "sources": ["/a", "/b"],
     }
     monkeypatch.setattr(sys, "argv", ["semble", "status"])
-    with patch("semble.cli._build_index", return_value=fake):
+    with patch("semble.cli._query_backend", return_value=fake):
         main()
     out = capsys.readouterr().out
     assert "Repos indexed : 2" in out

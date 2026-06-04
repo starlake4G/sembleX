@@ -1,6 +1,6 @@
 import logging
 
-from semble.chunking.core import chunk, chunk_lines, is_supported_language
+from semble.chunking.core import ChunkBoundary, chunk, chunk_lines, is_supported_language
 from semble.types import Chunk
 
 logger = logging.getLogger(__name__)
@@ -8,10 +8,42 @@ logger = logging.getLogger(__name__)
 # The desired length of chunks in chars.
 # TODO: makes this configurable
 _DESIRED_CHUNK_LENGTH_CHARS = 1500
+# Default hard cap on a single chunk's char length; see IndexingConfig.max_chunk_chars.
+# Used when chunk_source is called without an explicit cap (e.g. from tests).
+_DEFAULT_MAX_CHUNK_CHARS = 12_000
 
 
-def chunk_source(source: str, file_path: str, language: str | None) -> list[Chunk]:
-    """Chunk pre-read source text."""
+def _hard_split(boundaries: list[ChunkBoundary], max_chars: int) -> list[ChunkBoundary]:
+    """Split any boundary longer than *max_chars* into fixed-size pieces by char offset.
+
+    The tree-sitter chunker only enforces ``desired_length`` by recursing into a node's
+    children; a leaf with no children (a huge string/comment/data literal) and the
+    line-chunker's single oversized line both escape it. This pass is the safety net that
+    guarantees no chunk exceeds the embedding context, so nothing gets silently truncated.
+    """
+    if max_chars <= 0:
+        return boundaries
+    out: list[ChunkBoundary] = []
+    for boundary in boundaries:
+        if boundary.end - boundary.start <= max_chars:
+            out.append(boundary)
+            continue
+        start = boundary.start
+        while start < boundary.end:
+            end = min(start + max_chars, boundary.end)
+            out.append(ChunkBoundary(start=start, end=end))
+            start = end
+    return out
+
+
+def chunk_source(
+    source: str,
+    file_path: str,
+    language: str | None,
+    *,
+    max_chunk_chars: int = _DEFAULT_MAX_CHUNK_CHARS,
+) -> list[Chunk]:
+    """Chunk pre-read source text, hard-capping each chunk at *max_chunk_chars*."""
     if not source.strip():
         return []
     chunk_boundaries = None
@@ -21,6 +53,8 @@ def chunk_source(source: str, file_path: str, language: str | None) -> list[Chun
     # is a None.
     if chunk_boundaries is None:
         chunk_boundaries = chunk_lines(source, _DESIRED_CHUNK_LENGTH_CHARS)
+
+    chunk_boundaries = _hard_split(chunk_boundaries, max_chunk_chars)
 
     chunks: list[Chunk] = []
     for boundary in chunk_boundaries:

@@ -122,7 +122,7 @@ async def test_find_related_tool_repo_not_indexed() -> None:
 @pytest.mark.anyio
 async def test_serve_runs_stdio() -> None:
     with (
-        patch("semble.mcp.GlobalIndex", return_value=MagicMock()),
+        patch("semble.server.kernel.connect_or_spawn", return_value=MagicMock()),
         patch("mcp.server.fastmcp.FastMCP.run_stdio_async", new_callable=AsyncMock) as mock_run,
     ):
         await serve()

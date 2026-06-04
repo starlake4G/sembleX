@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -11,24 +12,46 @@ from semble.utils import _format_results, _is_git_url
 
 logger = logging.getLogger(__name__)
 
+# Timestamped, thread-tagged log lines. The thread name matters now that indexing runs
+# a producer/embed-workers/writer pipeline — it lets you see embed requests overlapping
+# parsing and writes, and read off real per-stage throughput from the timestamps.
+_LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
+        stream=sys.stderr,
+    )
+
 
 def main() -> None:
     """Run the Semble command-line entrypoint. With no subcommand, runs the MCP server."""
     parser = _build_parser()
     args = parser.parse_args()
 
+    if getattr(args, "no_kernel", False):
+        import os
+
+        os.environ["SEMBLE_NO_KERNEL"] = "1"
+
     if args.command in (None, "serve"):
         _run_serve(args)
         return
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+    _configure_logging()
 
     if args.command == "projects":
         _run_projects(args)
         return
 
     cfg = load_config(args.config)
-    if args.command in ("index", "reindex"):
+    if args.command == "kernel":
+        _run_kernel(args, cfg)
+    elif args.command in ("index", "reindex"):
         _run_index(args, cfg)
     elif args.command == "search":
         _run_search(args, cfg)
@@ -44,9 +67,23 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Cross-repo code search for agents (MCP-first). Run with no subcommand to start the MCP server.",
     )
     parser.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
+    parser.add_argument(
+        "--no-kernel",
+        action="store_true",
+        help="Bypass the shared warm-index kernel; cold-load in-process (slower, for debugging/CI).",
+    )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("serve", help="Run the cross-repo MCP server (default when no subcommand is given).")
+
+    kernel_p = sub.add_parser("kernel", help="Manage the shared warm-index daemon.")
+    kernel_p.add_argument(
+        "kernel_command",
+        nargs="?",
+        default="status",
+        choices=("start", "stop", "status", "restart", "run"),
+        help="start | stop | status | restart (default: status). 'run' stays in the foreground.",
+    )
 
     for name, help_text in (
         ("index", "Index a repo into the global index."),
@@ -104,13 +141,53 @@ def _run_serve(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     from semble.mcp import serve
 
+    _configure_logging()
     asyncio.run(serve(load_config(args.config)))
 
 
-def _build_index(cfg: SembleConfig):  # noqa: ANN202 — local helper, returns GlobalIndex
+def _build_index(cfg: SembleConfig):  # noqa: ANN202 — cold in-process GlobalIndex (for indexing).
     from semble.server.indexer import GlobalIndex
 
     return GlobalIndex(cfg)
+
+
+def _query_backend(cfg: SembleConfig):  # noqa: ANN202 — kernel client or cold GlobalIndex.
+    """Backend for read-only queries: a shared warm kernel, or a cold fallback."""
+    from semble.server.kernel import connect_or_spawn
+
+    return connect_or_spawn(cfg)
+
+
+def _run_kernel(args: argparse.Namespace, cfg: SembleConfig) -> None:
+    from semble.server import kernel
+
+    command = args.kernel_command
+    if command == "run":
+        kernel.run_kernel(cfg)
+        return
+    if command == "stop":
+        print("Kernel stopped." if kernel.stop_kernel(cfg) else "No running kernel.")
+        return
+    if command == "restart":
+        kernel.stop_kernel(cfg)
+    if command in ("start", "restart"):
+        backend = kernel.connect_or_spawn(cfg)
+        if isinstance(backend, kernel.KernelClient):
+            pong = backend.ping() or {}
+            info = kernel.read_kernel_info(Path(cfg.core.dir).expanduser())
+            where = f" on {info.host}:{info.port}" if info else ""
+            print(f"Kernel running{where} (pid {pong.get('pid')}, v{pong.get('version')}).")
+        else:
+            print("Kernel unavailable; would cold-load in-process.", file=sys.stderr)
+            sys.exit(1)
+        return
+    # status
+    info = kernel.kernel_status(cfg)
+    if info is None:
+        print("No running kernel.")
+    else:
+        age = max(0, int(time.time() - info.started_at))
+        print(f"Kernel running on {info.host}:{info.port} (pid {info.pid}, v{info.version}, up {age}s).")
 
 
 def _run_index(args: argparse.Namespace, cfg: SembleConfig) -> None:
@@ -162,7 +239,7 @@ def _run_index(args: argparse.Namespace, cfg: SembleConfig) -> None:
 def _run_search(args: argparse.Namespace, cfg: SembleConfig) -> None:
     from semble.server.metadata import RepoNotIndexedError
 
-    index = _build_index(cfg)
+    index = _query_backend(cfg)
     target = args.repo
     if target is None and args.scope == "workspace":
         target = str(Path.cwd())
@@ -181,7 +258,7 @@ def _run_search(args: argparse.Namespace, cfg: SembleConfig) -> None:
 def _run_find_related(args: argparse.Namespace, cfg: SembleConfig) -> None:
     from semble.server.metadata import RepoNotIndexedError
 
-    index = _build_index(cfg)
+    index = _query_backend(cfg)
     try:
         results = index.find_related(
             args.file_path,
@@ -200,7 +277,7 @@ def _run_find_related(args: argparse.Namespace, cfg: SembleConfig) -> None:
 
 
 def _run_status(cfg: SembleConfig) -> None:
-    index = _build_index(cfg)
+    index = _query_backend(cfg)
     status = index.status()
     print(f"Repos indexed : {status['repos']}")
     print(f"Chunks        : {status['chunks']}")

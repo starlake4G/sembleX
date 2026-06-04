@@ -138,6 +138,34 @@ def test_download_error() -> None:
         assert chunks is None
 
 
+def test_chunk_source_hard_caps_oversized_leaf() -> None:
+    """A giant single-token leaf (e.g. a base64/data literal) is hard-split to the cap.
+
+    Reproduces the silently-truncated oversized chunk: a string literal far larger than
+    desired_length is one tree-sitter leaf and used to be emitted whole. The hard cap
+    splits it into multiple chunks that each fit, losing nothing and covering the source.
+    """
+    blob = "z" * 50_000
+    code = f's = "{blob}"\n'
+    chunks = chunk_source(code, "data.py", "python", max_chunk_chars=12_000)
+    assert len(chunks) >= 5
+    for c in chunks:
+        assert len(c.content) <= 12_000
+    # The whole blob is preserved across the split (nothing silently truncated).
+    assert sum(len(c.content) for c in chunks) >= len(blob)
+    assert "".join(c.content for c in chunks).count("z") == len(blob)
+
+
+def test_chunk_source_hard_caps_minified_single_line() -> None:
+    """A minified one-line file (line-chunker path) is hard-split rather than kept whole."""
+    one_liner = "var d=[" + ",".join(str(i) for i in range(20_000)) + "];"
+    chunks = chunk_source(one_liner, "min.js.txt", None, max_chunk_chars=8_000)
+    assert len(chunks) >= 2
+    for c in chunks:
+        assert len(c.content) <= 8_000
+    assert "".join(c.content for c in chunks) == one_liner
+
+
 def test_chunker_deep_string(caplog: pytest.LogCaptureFixture) -> None:
     """Test that chunking works with a very deep string."""
     deep_string = "abs(0)\n"

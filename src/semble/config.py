@@ -40,6 +40,19 @@ class IndexingConfig(BaseModel):
 
     max_file_bytes: int = 1_000_000
     embed_batch_size: int = 512
+    # Hard upper bound on a single chunk's character length. The tree-sitter chunker's
+    # desired length is only a soft target: a leaf node with no splittable children (a
+    # giant string/comment/data literal, or a minified one-line file) is emitted whole
+    # and can be orders of magnitude larger. Such blobs used to hit the embedding
+    # context limit and get silently truncated. Anything above this cap is hard-split by
+    # character offset so nothing is dropped. Kept comfortably below the embedding token
+    # budget even for CJK-dense text (worst case ~1 token/char).
+    max_chunk_chars: int = 12_000
+    # Number of concurrent in-flight embedding requests during indexing. The producer
+    # (file walk + tree-sitter parse) and the writer (Milvus + SQLite) run concurrently
+    # with these workers, so the embed endpoint stays saturated instead of idling while
+    # the client parses the next batch or flushes the previous one.
+    embed_workers: int = 4
 
 
 class CoreDbConfig(BaseModel):
@@ -67,12 +80,36 @@ class MilvusConfig(BaseModel):
     consistency_level: str = "Bounded"
 
 
+class KernelConfig(BaseModel):
+    """Shared warm-index daemon.
+
+    Loading the global BM25 index costs ~tens of seconds, so every cold CLI call
+    used to pay it. The kernel is a single localhost daemon that holds one warm
+    ``GlobalIndex``; CLI and the MCP server connect to it as thin clients and
+    share it, so only the first call pays the warmup. It auto-stops after
+    ``idle_timeout`` seconds with no requests.
+    """
+
+    enabled: bool = True
+    # Auto-spawn a kernel when a client finds none running. When False, clients
+    # use a kernel only if one is already up, otherwise fall back to a cold load.
+    autostart: bool = True
+    host: str = "127.0.0.1"
+    # 0 lets the OS pick a free port (written to the kernel state file).
+    port: int = 0
+    # Shut down after this many seconds with no client request.
+    idle_timeout: float = 900.0
+    # Max seconds a client waits for a freshly spawned kernel to finish warming up.
+    startup_timeout: float = 90.0
+
+
 class SembleConfig(BaseModel):
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     reranker: RerankerConfig = Field(default_factory=RerankerConfig)
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     core: CoreDbConfig = Field(default_factory=CoreDbConfig)
     milvus: MilvusConfig = Field(default_factory=MilvusConfig)
+    kernel: KernelConfig = Field(default_factory=KernelConfig)
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
