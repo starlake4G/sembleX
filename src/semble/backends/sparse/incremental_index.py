@@ -54,6 +54,9 @@ class IncrementalSparseIndex(SparseIndex):
     def add_documents(self, chunks: Sequence[Chunk], chunk_ids: Sequence[str]) -> None:
         if len(chunks) != len(chunk_ids):
             raise ValueError(f"chunks ({len(chunks)}) and chunk_ids ({len(chunk_ids)}) length mismatch")
+        existing = [cid for cid in chunk_ids if cid in self._tokens_by_chunk]
+        if existing:
+            self.remove_documents(existing)
         total_length = self._avgdl * self._N
         for chunk, cid in zip(chunks, chunk_ids):
             tokens = tokenize_for_bm25(chunk)

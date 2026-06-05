@@ -17,6 +17,35 @@ logger = logging.getLogger(__name__)
 # parsing and writes, and read off real per-stage throughput from the timestamps.
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
 _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+_DEFAULT_CONFIG_PATH = Path("semble.yaml")
+_CONFIG_TEMPLATE = """# SembleX configuration.
+# Edit the service URLs/model to match your Milvus and OpenAI-compatible embedding endpoint.
+
+embedding:
+  backend: openai_compat
+  openai_base_url: http://127.0.0.1:8000/v1
+  openai_api_key: ${SEMBLE_EMBED_KEY:-dummy}
+  openai_model: your-code-embedding-model
+  openai_dim: 2048
+  max_context_tokens: 32768
+
+milvus:
+  uri: http://127.0.0.1:19530
+  collection: semble_global
+  metric_type: IP
+
+core:
+  dir: ~/.semble/core
+
+kernel:
+  enabled: true
+  autostart: true
+  idle_timeout: 900
+  startup_timeout: 90
+
+reranker:
+  backend: rules
+"""
 
 
 def _configure_logging() -> None:
@@ -44,11 +73,14 @@ def main() -> None:
 
     _configure_logging()
 
+    if args.command == "init":
+        _run_init(args)
+        return
     if args.command == "projects":
         _run_projects(args)
         return
 
-    cfg = load_config(args.config)
+    cfg = load_config()
     if args.command == "kernel":
         _run_kernel(args, cfg)
     elif args.command in ("index", "reindex"):
@@ -66,7 +98,6 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="semble",
         description="Cross-repo code search for agents (MCP-first). Run with no subcommand to start the MCP server.",
     )
-    parser.add_argument("--config", default=None, help="Path to semble config file (YAML or JSON).")
     parser.add_argument(
         "--no-kernel",
         action="store_true",
@@ -75,6 +106,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("serve", help="Run the cross-repo MCP server (default when no subcommand is given).")
+
+    init_p = sub.add_parser("init", help="Create a local semble.yaml configuration template.")
+    init_p.add_argument(
+        "--path",
+        default=str(_DEFAULT_CONFIG_PATH),
+        help="Where to write the config (default: ./semble.yaml).",
+    )
+    init_p.add_argument("--force", action="store_true", help="Overwrite an existing config file.")
 
     kernel_p = sub.add_parser("kernel", help="Manage the shared warm-index daemon.")
     kernel_p.add_argument(
@@ -142,7 +181,7 @@ def _run_serve(args: argparse.Namespace) -> None:
     from semble.mcp import serve
 
     _configure_logging()
-    asyncio.run(serve(load_config(args.config)))
+    asyncio.run(serve(load_config()))
 
 
 def _build_index(cfg: SembleConfig):  # noqa: ANN202 — cold in-process GlobalIndex (for indexing).
@@ -156,6 +195,18 @@ def _query_backend(cfg: SembleConfig):  # noqa: ANN202 — kernel client or cold
     from semble.server.kernel import connect_or_spawn
 
     return connect_or_spawn(cfg)
+
+
+def _run_init(args: argparse.Namespace) -> None:
+    path = Path(args.path).expanduser()
+    if path.exists() and not args.force:
+        print(f"Config already exists: {path}. Use --force to overwrite.", file=sys.stderr)
+        sys.exit(1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_CONFIG_TEMPLATE, encoding="utf-8")
+    print(f"Wrote config template: {path}")
+    if path.name != _DEFAULT_CONFIG_PATH.name:
+        print(f"Use SEMBLE_CONFIG={path} to load this config.")
 
 
 def _run_kernel(args: argparse.Namespace, cfg: SembleConfig) -> None:

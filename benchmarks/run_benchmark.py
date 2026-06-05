@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 from model2vec import StaticModel
+from semble.index.dense import _DEFAULT_MODEL_NAME
 
 from benchmarks.data import (
     RepoSpec,
@@ -17,7 +18,6 @@ from benchmarks.data import (
 )
 from benchmarks.metrics import ndcg_at_k, target_rank
 from semble import SembleIndex
-from semble.index.dense import _DEFAULT_MODEL_NAME
 from semble.types import SearchResult
 
 _LATENCY_RUNS = 5

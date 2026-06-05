@@ -173,6 +173,35 @@ def test_deferred_persist_defers_bm25_save_until_flush(index, tmp_path: Path) ->
     assert marker.stat().st_mtime > before
 
 
+def test_force_reindex_refreshes_missing_vectors(index, tmp_path: Path) -> None:  # noqa: ANN001
+    repo = _make_repo(tmp_path / "src", "repo")
+    index.index_repo(str(repo))
+    repo_id = index.resolve_repo_id(str(repo))
+    assert repo_id is not None
+    assert index._vector_store._data[repo_id]
+
+    index._vector_store._data[repo_id].clear()
+    assert not index._vector_store._data[repo_id]
+
+    outcome = index.index_repo(str(repo), force=True)
+    assert outcome.indexed is True
+    assert index._vector_store._data[repo_id]
+
+
+def test_empty_repo_reindex_removes_stale_chunks(index, tmp_path: Path) -> None:  # noqa: ANN001
+    repo = _make_repo(tmp_path / "src", "repo")
+    index.index_repo(str(repo))
+    assert index.search("authenticate", top_k=5, repo=str(repo))
+
+    (repo / "auth.py").unlink()
+    with pytest.raises(ValueError, match="No supported files"):
+        index.index_repo(str(repo))
+
+    assert index._metadata.total_chunk_count() == 0
+    assert index._sparse.doc_count == 0
+    assert index.search("authenticate", top_k=5) == []
+
+
 def test_load_rebuilds_bm25_when_inconsistent_with_metadata(index, tmp_path: Path) -> None:  # noqa: ANN001
     from semble.server.indexer import GlobalIndex
 

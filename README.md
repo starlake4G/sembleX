@@ -80,7 +80,13 @@ Extras: `mcp` (MCP server), `yaml` (YAML config), `tokenizer` (tiktoken token co
 
 ## Configuration
 
-Create `semble.yaml` (YAML or JSON; env vars like `${VAR:-default}` are substituted). All keys have defaults; the example below shows the ones you'll usually set:
+Create `semble.yaml` (YAML or JSON; env vars like `${VAR:-default}` are substituted). The quickest path is:
+
+```bash
+semble init
+```
+
+All keys have defaults; the example below shows the ones you'll usually set:
 
 ```yaml
 embedding:
@@ -103,35 +109,35 @@ reranker:
   backend: rules                                    # lightweight code-aware ranking
 ```
 
-Config is loaded via `--config <path>`, the `SEMBLE_CONFIG` env var, or auto-discovery (`./semble.yaml`, `~/.config/semble/config.yaml`, `~/.semble/config.yaml`, …).
+Config is loaded via the `SEMBLE_CONFIG` env var or auto-discovery (`./semble.yaml`, `~/.config/semble/config.yaml`, `~/.semble/config.yaml`, ...).
 
 ## Quickstart
 
 ```bash
 # 1. Register repos. Either add them one by one…
-semble --config semble.yaml projects add /path/to/repo-a
-semble --config semble.yaml projects add https://github.com/some-org/repo-b
+semble projects add /path/to/repo-a
+semble projects add https://github.com/some-org/repo-b
 # …or scan a directory tree and register every git repo under it:
-semble --config semble.yaml projects scan /path/to/all/my/repos --depth 3
+semble projects scan /path/to/all/my/repos --depth 3
 
 # 2. Build the global index (embeds + writes to Milvus + builds BM25)
-semble --config semble.yaml index --all
+semble index --all
 
 # 3. Search across every indexed repo
-semble --config semble.yaml search "incremental sparse BM25 index add and remove" -k 8
+semble search "incremental sparse BM25 index add and remove" -k 8
 
 # 4. From a result's repo/file/line, find similar code in OTHER repos
-semble --config semble.yaml find-related /path/to/repo-a src/foo/chunking.py 42 -k 6
+semble find-related /path/to/repo-a src/foo/chunking.py 42 -k 6
 
 # 5. Inspect the index
-semble --config semble.yaml status
+semble status
 ```
 
 A single repo can be (re)indexed by passing its path/URL instead of `--all`: `semble index /path/to/repo-a` (no-op if unchanged; use `reindex` or `--force` to rebuild).
 
 ## MCP integration
 
-The MCP server is the primary interface. It builds one warm `GlobalIndex` at startup and serves two tools over stdio.
+The MCP server is the primary interface. It connects to the shared warm kernel and serves two tools over stdio.
 
 ### Tools
 
@@ -145,7 +151,7 @@ The MCP server is the primary interface. It builds one warm `GlobalIndex` at sta
 ### Register with Claude Code
 
 ```bash
-claude mcp add semblex -s user -- semble --config /abs/path/to/semble.yaml serve
+claude mcp add semblex -s user -- semble serve
 ```
 
 <details>
@@ -158,13 +164,13 @@ Use the same command in each harness's MCP config. For example, Cursor (`~/.curs
   "mcpServers": {
     "semblex": {
       "command": "semble",
-      "args": ["--config", "/abs/path/to/semble.yaml", "serve"]
+      "args": ["serve"]
     }
   }
 }
 ```
 
-The pattern is identical for Codex (`~/.codex/config.toml`), VS Code (`.vscode/mcp.json`), Windsurf, Gemini CLI, etc. — set `command` to `semble` (or an absolute path to it) and `args` to `["--config", "<path>", "serve"]`.
+The pattern is identical for Codex (`~/.codex/config.toml`), VS Code (`.vscode/mcp.json`), Windsurf, Gemini CLI, etc. — set `command` to `semble` (or an absolute path to it) and `args` to `["serve"]`. If the config is not auto-discoverable, set `SEMBLE_CONFIG` in the MCP client's environment.
 
 </details>
 
@@ -172,10 +178,11 @@ The pattern is identical for Codex (`~/.codex/config.toml`), VS Code (`.vscode/m
 
 ## CLI reference
 
-`semble [--config PATH] <command>`
+`semble <command>`
 
 | Command | Purpose |
 |---------|---------|
+| `init [--path PATH] [--force]` | Create a local `semble.yaml` configuration template. |
 | `serve` | Run the cross-repo MCP server over stdio (default when no subcommand is given). |
 | `index [source] [--all] [--ref REF] [--include-text-files] [--force]` | Index a repo (local path or git URL) into the global index, or `--all` registered projects. `--ref` selects a branch/tag for git URLs; `--include-text-files` also indexes non-code text; `--force` rebuilds. |
 | `reindex [source] [--all] ...` | Alias for `index --force`. |

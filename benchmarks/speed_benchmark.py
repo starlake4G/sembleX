@@ -6,12 +6,12 @@ from dataclasses import dataclass
 
 import numpy as np
 from model2vec import StaticModel
+from semble.index.dense import _DEFAULT_MODEL_NAME
 from sentence_transformers import SentenceTransformer
 
 from benchmarks.data import RepoSpec, Task, available_repo_specs, load_tasks, save_results
 from benchmarks.tools import run_colgrep_files, run_ripgrep_count
 from semble import SembleIndex
-from semble.index.dense import _DEFAULT_MODEL_NAME
 from semble.types import EmbeddingMatrix, Encoder
 
 # One representative repo per language (medium size, healthy NDCG on the main benchmark).

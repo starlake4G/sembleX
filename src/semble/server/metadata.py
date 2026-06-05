@@ -80,6 +80,24 @@ class MetadataStore:
         row = self._conn.execute("select chunk_count from repos where repo_id = ?", (repo_id,)).fetchone()
         return int(row["chunk_count"]) if row is not None else 0
 
+    def repo_info(self, repo_id: str) -> dict[str, object] | None:
+        """Return stored repo metadata, or None if the repo is not indexed."""
+        row = self._conn.execute("select * from repos where repo_id = ?", (repo_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "repo_id": str(row["repo_id"]),
+            "source": str(row["source"]),
+            "source_path": str(row["source_path"]),
+            "include_text_files": bool(row["include_text_files"]),
+            "embedding_model": str(row["embedding_model"]),
+            "embedding_dim": int(row["embedding_dim"]),
+            "chunker_version": str(row["chunker_version"]),
+            "commit_sha": str(row["commit_sha"]) if row["commit_sha"] is not None else None,
+            "indexed_at": str(row["indexed_at"]),
+            "chunk_count": int(row["chunk_count"]),
+        }
+
     def repo_ids_for_source(self, source: str) -> list[str]:
         return [
             str(row["repo_id"])
@@ -151,6 +169,18 @@ class MetadataStore:
                 ) values (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
+            )
+
+    def delete_chunks(self, repo_id: str, chunk_ids: Iterable[str]) -> None:
+        """Delete selected chunks for *repo_id*."""
+        ids = list(chunk_ids)
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._conn:
+            self._conn.execute(
+                f"delete from chunks where repo_id = ? and chunk_id in ({placeholders})",
+                [repo_id, *ids],
             )
 
     def get_chunks(self, chunk_ids: list[str]) -> dict[str, Chunk]:

@@ -77,6 +77,19 @@ def test_reindex_forces(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys:
     assert kwargs["force"] is True
 
 
+def test_init_writes_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = tmp_path / "semble.yaml"
+    monkeypatch.setattr(sys, "argv", ["semble", "init", "--path", str(cfg)])
+    main()
+    out = capsys.readouterr().out
+    assert "Wrote config template" in out
+    assert "openai_base_url: http://127.0.0.1:8000/v1" in cfg.read_text(encoding="utf-8")
+
+
 def test_status_command(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     fake = MagicMock()
     fake.status.return_value = {

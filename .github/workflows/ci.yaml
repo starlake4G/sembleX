@@ -52,6 +52,12 @@ jobs:
       - name: Run tests under coverage
         run: pytest
 
+      - name: Run ruff
+        run: ruff check src tests
+
+      - name: Run mypy
+        run: mypy src
+
       - name: Upload results to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238
         with:

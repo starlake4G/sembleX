@@ -80,7 +80,13 @@ Extras：`mcp`（MCP server）、`yaml`（YAML 配置）、`tokenizer`（tiktoke
 
 ## 配置
 
-创建 `semble.yaml`（YAML 或 JSON；支持 `${VAR:-default}` 形式的环境变量替换）。所有键都有默认值，下面只列你通常需要设置的：
+创建 `semble.yaml`（YAML 或 JSON；支持 `${VAR:-default}` 形式的环境变量替换）。最快方式是：
+
+```bash
+semble init
+```
+
+所有键都有默认值，下面只列你通常需要设置的：
 
 ```yaml
 embedding:
@@ -103,35 +109,35 @@ reranker:
   backend: rules                                    # 轻量级代码感知排序
 ```
 
-配置通过 `--config <path>`、`SEMBLE_CONFIG` 环境变量，或自动发现（`./semble.yaml`、`~/.config/semble/config.yaml`、`~/.semble/config.yaml` 等）加载。
+配置通过 `SEMBLE_CONFIG` 环境变量或自动发现（`./semble.yaml`、`~/.config/semble/config.yaml`、`~/.semble/config.yaml` 等）加载。
 
 ## 快速上手
 
 ```bash
 # 1. 注册仓库。可以逐个添加……
-semble --config semble.yaml projects add /path/to/repo-a
-semble --config semble.yaml projects add https://github.com/some-org/repo-b
+semble projects add /path/to/repo-a
+semble projects add https://github.com/some-org/repo-b
 # ……或扫描一个目录树，注册其下所有 git 仓库：
-semble --config semble.yaml projects scan /path/to/all/my/repos --depth 3
+semble projects scan /path/to/all/my/repos --depth 3
 
 # 2. 构建全局索引（embedding + 写入 Milvus + 构建 BM25）
-semble --config semble.yaml index --all
+semble index --all
 
 # 3. 在所有已索引仓库范围内搜索
-semble --config semble.yaml search "增量稀疏 BM25 索引的增删" -k 8
+semble search "增量稀疏 BM25 索引的增删" -k 8
 
 # 4. 从某条结果的 repo/file/line，在其它仓库找相似代码
-semble --config semble.yaml find-related /path/to/repo-a src/foo/chunking.py 42 -k 6
+semble find-related /path/to/repo-a src/foo/chunking.py 42 -k 6
 
 # 5. 查看索引状态
-semble --config semble.yaml status
+semble status
 ```
 
 要（重新）索引单个仓库，传它的路径/URL 而非 `--all`：`semble index /path/to/repo-a`（未变化则为空操作；用 `reindex` 或 `--force` 强制重建）。
 
 ## MCP 集成
 
-MCP server 是主接口。启动时构建一份常驻预热的 `GlobalIndex`，通过 stdio 提供两个工具。
+MCP server 是主接口。它连接共享的预热 kernel，并通过 stdio 提供两个工具。
 
 ### 工具
 
@@ -145,7 +151,7 @@ MCP server 是主接口。启动时构建一份常驻预热的 `GlobalIndex`，�
 ### 注册到 Claude Code
 
 ```bash
-claude mcp add semblex -s user -- semble --config /abs/path/to/semble.yaml serve
+claude mcp add semblex -s user -- semble serve
 ```
 
 <details>
@@ -158,13 +164,13 @@ claude mcp add semblex -s user -- semble --config /abs/path/to/semble.yaml serve
   "mcpServers": {
     "semblex": {
       "command": "semble",
-      "args": ["--config", "/abs/path/to/semble.yaml", "serve"]
+      "args": ["serve"]
     }
   }
 }
 ```
 
-Codex（`~/.codex/config.toml`）、VS Code（`.vscode/mcp.json`）、Windsurf、Gemini CLI 等模式相同——把 `command` 设为 `semble`（或其绝对路径），`args` 设为 `["--config", "<path>", "serve"]`。
+Codex（`~/.codex/config.toml`）、VS Code（`.vscode/mcp.json`）、Windsurf、Gemini CLI 等模式相同——把 `command` 设为 `semble`（或其绝对路径），`args` 设为 `["serve"]`。如果配置文件不在自动发现路径中，请在 MCP 客户端环境里设置 `SEMBLE_CONFIG`。
 
 </details>
 
@@ -172,10 +178,11 @@ Codex（`~/.codex/config.toml`）、VS Code（`.vscode/mcp.json`）、Windsurf�
 
 ## CLI 参考
 
-`semble [--config PATH] <command>`
+`semble <command>`
 
 | 命令 | 用途 |
 |------|------|
+| `init [--path PATH] [--force]` | 创建本地 `semble.yaml` 配置模板。 |
 | `serve` | 通过 stdio 运行跨库 MCP server（不带子命令时的默认行为）。 |
 | `index [source] [--all] [--ref REF] [--include-text-files] [--force]` | 将仓库（本地路径或 git URL）索引进全局索引，或用 `--all` 索引所有已注册项目。`--ref` 为 git URL 选择分支/标签；`--include-text-files` 一并索引非代码文本；`--force` 强制重建。 |
 | `reindex [source] [--all] ...` | `index --force` 的别名。 |

@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 import numpy as np
 from model2vec import StaticModel
+from semble.index.dense import _DEFAULT_MODEL_NAME
 
 from benchmarks.data import (
     RepoSpec,
@@ -18,7 +19,6 @@ from benchmarks.data import (
 )
 from benchmarks.run_benchmark import RepoResult, evaluate
 from semble import SembleIndex
-from semble.index.dense import _DEFAULT_MODEL_NAME
 
 # alpha=None  → raw mode, input depends on query
 # alpha=0.0   → hybrid pipeline, BM25-only input

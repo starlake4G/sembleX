@@ -15,6 +15,8 @@ request, so a running kernel never serves stale results after a reindex.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -25,7 +27,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from semble.config import SembleConfig
 from semble.server.metadata import RepoNotIndexedError
@@ -47,6 +49,11 @@ _ENCODING = "utf-8"
 # --------------------------------------------------------------------------- state file
 
 
+def _config_fingerprint(config: SembleConfig) -> str:
+    raw = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode(_ENCODING)).hexdigest()
+
+
 @dataclass(frozen=True)
 class KernelInfo:
     """Connection details for a running kernel, persisted to the core dir."""
@@ -57,6 +64,7 @@ class KernelInfo:
     pid: int
     version: str
     started_at: float
+    config_fingerprint: str = ""
 
 
 def _kernel_file(core_dir: Path) -> Path:
@@ -75,6 +83,7 @@ def read_kernel_info(core_dir: Path) -> KernelInfo | None:
             pid=int(raw["pid"]),
             version=raw["version"],
             started_at=float(raw["started_at"]),
+            config_fingerprint=str(raw.get("config_fingerprint", "")),
         )
     except (OSError, ValueError, KeyError):
         return None
@@ -91,6 +100,7 @@ def _write_kernel_info(core_dir: Path, info: KernelInfo) -> None:
                 "pid": info.pid,
                 "version": info.version,
                 "started_at": info.started_at,
+                "config_fingerprint": info.config_fingerprint,
             }
         ),
         encoding=_ENCODING,
@@ -103,6 +113,34 @@ def _remove_kernel_info(core_dir: Path) -> None:
         _kernel_file(core_dir).unlink()
     except OSError:
         pass
+
+
+@contextlib.contextmanager
+def _spawn_lock(core_dir: Path, *, timeout: float) -> Iterator[bool]:
+    path = core_dir / _SPAWN_LOCK
+    deadline = time.monotonic() + timeout
+    stale_after = max(timeout, 30.0)
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                if time.time() - path.stat().st_mtime > stale_after:
+                    path.unlink()
+                    continue
+            if time.monotonic() >= deadline:
+                yield False
+                return
+            time.sleep(0.2)
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding=_ENCODING) as f:
+                f.write(str(os.getpid()))
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return
 
 
 # --------------------------------------------------------------------------- (de)serialize
@@ -174,6 +212,7 @@ class _KernelServer:
             pid=os.getpid(),
             version=__version__,
             started_at=time.time(),
+            config_fingerprint=_config_fingerprint(self._config),
         )
         _write_kernel_info(self._core_dir, info)
         logger.info("Kernel ready on %s:%d (pid %d, v%s)", info.host, port, info.pid, __version__)
@@ -346,7 +385,7 @@ class KernelClient:
 # --------------------------------------------------------------------------- discovery / spawn
 
 
-def _healthy_client(core_dir: Path) -> KernelClient | None:
+def _healthy_client(core_dir: Path, config_fingerprint: str | None = None) -> KernelClient | None:
     """Return a client for a running, version-matching kernel, or None."""
     info = read_kernel_info(core_dir)
     if info is None:
@@ -360,6 +399,10 @@ def _healthy_client(core_dir: Path) -> KernelClient | None:
         logger.info("Kernel v%s != client v%s; restarting", pong.get("version"), __version__)
         client.shutdown()
         return None
+    if config_fingerprint is not None and info.config_fingerprint != config_fingerprint:
+        logger.info("Kernel config changed; restarting")
+        client.shutdown()
+        return None
     return client
 
 
@@ -370,36 +413,18 @@ def _spawn_kernel(core_dir: Path) -> None:
     launcher unlocked, so a running kernel never blocks ``pip`` reinstalls.
     """
     core_dir.mkdir(parents=True, exist_ok=True)
-    log = open(core_dir / _KERNEL_LOG, "ab")  # noqa: SIM115 — handed to the child process.
     cmd = [sys.executable, "-m", "semble", "kernel", "run"]
+    log = open(core_dir / _KERNEL_LOG, "ab")  # noqa: SIM115 — child inherits the handle during Popen.
     kwargs: dict[str, Any] = {"stdout": log, "stderr": log, "stdin": subprocess.DEVNULL}
     if os.name == "nt":
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console, survives parent exit.
         kwargs["creationflags"] = 0x00000008 | 0x00000200
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(cmd, **kwargs)  # noqa: S603 — fixed argv, no shell.
-
-
-def _try_spawn_lock(path: Path, *, stale: float = 180.0) -> bool:
-    """Atomically claim the spawn lock so only one client launches a kernel.
-
-    Returns True if this caller now holds the lock. A pre-existing lock older
-    than *stale* (a crashed spawner) is reclaimed.
-    """
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        return True
-    except FileExistsError:
-        try:
-            if time.time() - path.stat().st_mtime > stale:
-                path.unlink()
-                return _try_spawn_lock(path, stale=stale)
-        except OSError:
-            pass
-        return False
+        subprocess.Popen(cmd, **kwargs)  # noqa: S603 — fixed argv, no shell.
+    finally:
+        log.close()
 
 
 def connect_or_spawn(config: SembleConfig, *, allow_spawn: bool = True) -> Any:
@@ -412,37 +437,36 @@ def connect_or_spawn(config: SembleConfig, *, allow_spawn: bool = True) -> Any:
     if the kernel is disabled or unreachable.
     """
     core_dir = Path(config.core.dir).expanduser()
+    fingerprint = _config_fingerprint(config)
     use_kernel = config.kernel.enabled and not os.environ.get("SEMBLE_NO_KERNEL")
     if not use_kernel:
         return _cold_index(config)
 
-    client = _healthy_client(core_dir)
+    client = _healthy_client(core_dir, fingerprint)
     if client is not None:
         return client
     if not (allow_spawn and config.kernel.autostart):
         return _cold_index(config)
 
-    lock = core_dir / _SPAWN_LOCK
-    have_lock = _try_spawn_lock(lock)
     try:
-        # Another caller may have spawned while we contended for the lock.
-        client = _healthy_client(core_dir)
-        if client is not None:
-            return client
-        if have_lock:
-            _spawn_kernel(core_dir)
+        core_dir.mkdir(parents=True, exist_ok=True)
+        lock_timeout = min(max(config.kernel.startup_timeout, 1.0), 30.0)
         deadline = time.monotonic() + config.kernel.startup_timeout
-        while time.monotonic() < deadline:
-            time.sleep(0.5)
-            client = _healthy_client(core_dir)
+        with _spawn_lock(core_dir, timeout=lock_timeout) as have_lock:
+            # Another caller may have spawned while we contended for the lock.
+            client = _healthy_client(core_dir, fingerprint)
             if client is not None:
                 return client
-    finally:
-        if have_lock:
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+            if have_lock:
+                _spawn_kernel(core_dir)
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                client = _healthy_client(core_dir, fingerprint)
+                if client is not None:
+                    return client
+    except OSError:
+        logger.warning("Kernel spawn setup failed; using cold load", exc_info=True)
+        return _cold_index(config)
     logger.warning("Kernel did not become ready in %.0fs; using cold load", config.kernel.startup_timeout)
     return _cold_index(config)
 
@@ -460,7 +484,7 @@ def run_kernel(config: SembleConfig) -> None:
     """Run the kernel daemon (foreground). Exits if a healthy kernel already runs."""
     core_dir = Path(config.core.dir).expanduser()
     core_dir.mkdir(parents=True, exist_ok=True)
-    if _healthy_client(core_dir) is not None:
+    if _healthy_client(core_dir, _config_fingerprint(config)) is not None:
         logger.info("A healthy kernel is already running; exiting")
         return
 
@@ -478,7 +502,7 @@ def run_kernel(config: SembleConfig) -> None:
 def kernel_status(config: SembleConfig) -> KernelInfo | None:
     """Return info for a running kernel, or None."""
     core_dir = Path(config.core.dir).expanduser()
-    client = _healthy_client(core_dir)
+    client = _healthy_client(core_dir, _config_fingerprint(config))
     if client is None:
         return None
     return read_kernel_info(core_dir)

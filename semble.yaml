@@ -1,15 +1,20 @@
 embedding:
   backend: openai_compat
-  openai_base_url: http://100.88.1.2:8000/v1
+  openai_base_url: http://127.0.0.1:8000/v1
   openai_api_key: ${SEMBLE_EMBED_KEY:-dummy}
-  openai_model: Qwen/Qwen3-VL-Embedding-2B
+  openai_model: your-code-embedding-model
   openai_dim: 2048
   max_context_tokens: 32768
 milvus:
-  uri: http://100.88.1.2:19530
+  uri: http://127.0.0.1:19530
   collection: semble_global
   metric_type: IP
 core:
   dir: ~/.semble/core
+kernel:
+  enabled: true
+  autostart: true
+  idle_timeout: 900
+  startup_timeout: 90
 reranker:
   backend: rules

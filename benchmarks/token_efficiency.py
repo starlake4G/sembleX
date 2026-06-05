@@ -13,6 +13,7 @@ import matplotlib.ticker as ticker
 import numpy as np
 import tiktoken
 from model2vec import StaticModel
+from semble.index.dense import _DEFAULT_MODEL_NAME
 
 from benchmarks.data import (
     Target,
@@ -24,7 +25,6 @@ from benchmarks.data import (
     target_matches_location,
 )
 from semble import SembleIndex
-from semble.index.dense import _DEFAULT_MODEL_NAME
 from semble.index.file_walker import DEFAULT_IGNORED_DIRS, FILE_TYPES, FileCategory
 from semble.ranking.boosting import _STOPWORDS as _SEMBLE_STOPWORDS
 from semble.types import Chunk

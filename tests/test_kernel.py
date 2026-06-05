@@ -5,9 +5,9 @@ from semble.server.kernel import (
     KernelInfo,
     _result_from_dict,
     _result_to_dict,
+    _write_kernel_info,
     connect_or_spawn,
     read_kernel_info,
-    _write_kernel_info,
 )
 from semble.types import Chunk, SearchResult
 
@@ -78,3 +78,33 @@ def test_connect_or_spawn_no_autostart_uses_cold(monkeypatch, tmp_path: Path) ->
     cfg.kernel.autostart = False
     cfg.core.dir = tmp_path
     assert connect_or_spawn(cfg) is sentinel
+
+
+def test_connect_or_spawn_holds_lock_until_kernel_ready(monkeypatch, tmp_path: Path) -> None:
+    """The spawning client keeps the lock while waiting for kernel.json to become healthy."""
+    sentinel = object()
+    spawned = False
+    saw_lock_after_spawn: list[bool] = []
+
+    def _healthy(core: Path, _fingerprint: str | None = None):  # noqa: ANN202
+        if spawned:
+            saw_lock_after_spawn.append((core / "kernel.lock").exists())
+            return sentinel
+        return None
+
+    def _spawn(_core: Path) -> None:
+        nonlocal spawned
+        spawned = True
+
+    monkeypatch.setattr("semble.server.kernel._healthy_client", _healthy)
+    monkeypatch.setattr("semble.server.kernel._spawn_kernel", _spawn)
+    monkeypatch.setattr("semble.server.kernel.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("semble.server.kernel._cold_index", lambda cfg: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.delenv("SEMBLE_NO_KERNEL", raising=False)
+
+    cfg = SembleConfig()
+    cfg.core.dir = tmp_path
+    cfg.kernel.startup_timeout = 1
+
+    assert connect_or_spawn(cfg) is sentinel
+    assert saw_lock_after_spawn == [True]

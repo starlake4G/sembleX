@@ -151,38 +151,66 @@ class GlobalIndex:
             always persisted regardless of this flag.
         :returns: The outcome (repo id, chunk count, whether it was (re)indexed).
         """
-        repo_id = self._repo_id(repo)
+        repo_id = self._repo_id(repo, ref=ref)
+        source_key = self._repo_identity(repo, ref=ref)
         with self._lock:
-            if not force and self._metadata.has_repo(repo_id):
+            source_path, commit_sha = self._prepare_source(repo, ref=ref, force=force)
+            source_state = self._source_state(source_path, include_text_files)
+
+            existing = self._metadata.repo_info(repo_id)
+            if (
+                not force
+                and existing is not None
+                and existing.get("commit_sha") == source_state
+                and existing.get("include_text_files") == include_text_files
+            ):
                 return IndexOutcome(repo_id, self._metadata.repo_chunk_count(repo_id), indexed=False)
 
-            source_path, commit_sha = self._prepare_source(repo, ref=ref, force=force)
-
             old_ids = self._metadata.chunk_ids(repo_id)
-            self._metadata.start_repo_replace(repo_id)
-            self._vector_store.clear(repo_id)
-            if old_ids:
+            old_id_set = set(old_ids)
+            if force and old_ids:
+                self._metadata.start_repo_replace(repo_id)
+                self._vector_store.clear(repo_id)
                 self._sparse.remove_documents(old_ids)
+                old_ids = []
+                old_id_set = set()
 
-            chunks, ids = self._index_chunks_streaming(repo_id, source_path, include_text_files)
+            chunks, ids = self._index_chunks_streaming(
+                repo_id,
+                source_path,
+                include_text_files,
+                existing_ids=old_id_set,
+            )
             if not chunks:
+                if old_ids:
+                    self._metadata.start_repo_replace(repo_id)
+                    self._vector_store.clear(repo_id)
+                    self._sparse.remove_documents(old_ids)
+                    self._refresh_repos()
                 if persist:
                     self._save_sparse()
                 raise ValueError(f"No supported files found under {source_path}.")
 
+            new_id_set = set(ids)
+            removed_ids = [cid for cid in old_ids if cid not in new_id_set]
+            if removed_ids:
+                self._vector_store.delete(repo_id, removed_ids)
+                self._metadata.delete_chunks(repo_id, removed_ids)
+            if old_ids:
+                self._sparse.remove_documents(old_ids)
             self._sparse.add_documents(chunks, ids)
             if persist:
                 self._save_sparse()
 
             self._metadata.finish_repo_replace(
                 repo_id=repo_id,
-                source=repo,
+                source=source_key,
                 source_path=str(source_path),
                 include_text_files=include_text_files,
                 embedding_model=self._embedding_model_name(),
                 embedding_dim=self._model.dim,
                 chunker_version=_CHUNKER_VERSION,
-                commit_sha=commit_sha,
+                commit_sha=source_state or commit_sha,
                 indexed_at=datetime.now(timezone.utc).isoformat(),
                 chunk_count=len(chunks),
             )
@@ -345,6 +373,8 @@ class GlobalIndex:
         repo_id: str,
         source_path: Path,
         include_text_files: bool,
+        *,
+        existing_ids: set[str] | None = None,
     ) -> tuple[list[Chunk], list[str]]:
         """Embed and store a repo's chunks as a producer/embed-workers/writer pipeline.
 
@@ -368,6 +398,8 @@ class GlobalIndex:
         write_lock = threading.Lock()
         kept_chunks: list[Chunk] = []
         kept_ids: list[str] = []
+        added_vector_ids: list[str] = []
+        existing_ids = existing_ids or set()
 
         def embed_and_store(batch: list[StoredChunk]) -> None:
             try:
@@ -376,7 +408,11 @@ class GlobalIndex:
                     return
                 ids = [s.chunk_id for s in survivors]
                 with write_lock:
-                    self._vector_store.add(repo_id, ids, vectors)
+                    new_positions = [i for i, cid in enumerate(ids) if cid not in existing_ids]
+                    if new_positions:
+                        new_ids = [ids[i] for i in new_positions]
+                        self._vector_store.add(repo_id, new_ids, vectors[new_positions])
+                        added_vector_ids.extend(new_ids)
                     self._metadata.insert_chunks(repo_id, survivors)
                     kept_chunks.extend(s.chunk for s in survivors)
                     kept_ids.extend(ids)
@@ -384,20 +420,31 @@ class GlobalIndex:
                 inflight.release()
 
         futures = []
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed") as executor:
-            batch: list[StoredChunk] = []
-            for chunk in self._iter_chunks(source_path, include_text_files):
-                batch.append(self._stored_chunk(repo_id, chunk))
-                if len(batch) >= self._config.indexing.embed_batch_size:
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed") as executor:
+                batch: list[StoredChunk] = []
+                for chunk in self._iter_chunks(source_path, include_text_files):
+                    batch.append(self._stored_chunk(repo_id, chunk))
+                    if len(batch) >= self._config.indexing.embed_batch_size:
+                        inflight.acquire()
+                        futures.append(executor.submit(embed_and_store, batch))
+                        batch = []
+                if batch:
                     inflight.acquire()
                     futures.append(executor.submit(embed_and_store, batch))
-                    batch = []
-            if batch:
-                inflight.acquire()
-                futures.append(executor.submit(embed_and_store, batch))
-        # Surface any unexpected worker exception (EmbeddingFailure is handled in-worker).
-        for future in futures:
-            future.result()
+            # Surface any unexpected worker exception (EmbeddingFailure is handled in-worker).
+            for future in futures:
+                future.result()
+        except Exception:
+            added_ids = list(
+                dict.fromkeys([*added_vector_ids, *(cid for cid in kept_ids if cid not in existing_ids)])
+            )
+            if added_ids:
+                with contextlib.suppress(Exception):
+                    self._vector_store.delete(repo_id, added_ids)
+                with contextlib.suppress(Exception):
+                    self._metadata.delete_chunks(repo_id, added_ids)
+            raise
         return kept_chunks, kept_ids
 
     def _embed_batch(self, batch: Sequence[StoredChunk]) -> tuple[list[StoredChunk], np.ndarray]:
@@ -454,6 +501,29 @@ class GlobalIndex:
         if not path.is_dir():
             raise NotADirectoryError(f"Repository path is not a directory: {repo}")
         return path, None
+
+    def _source_state(self, source_path: Path, include_text_files: bool) -> str:
+        git_sha = self._git_head_sha(source_path)
+        if git_sha and not self._git_dirty(source_path):
+            return f"git:{git_sha}"
+        return f"files:{self._tree_fingerprint(source_path, include_text_files)}"
+
+    def _tree_fingerprint(self, source_path: Path, include_text_files: bool) -> str:
+        digest = hashlib.sha256()
+        extensions = get_extensions(include_text_files, None)
+        for file_path in walk_files(source_path, extensions):
+            try:
+                stat = file_path.stat()
+                relative = file_path.relative_to(source_path).as_posix()
+            except OSError:
+                continue
+            digest.update(relative.encode("utf-8", errors="surrogatepass"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b":")
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     def _clone_or_update(self, url: str, *, ref: str | None, force: bool) -> Path:
         key = self._hash(f"{url}|{ref or 'HEAD'}", size=16)
@@ -517,8 +587,28 @@ class GlobalIndex:
             return None
         return result.stdout.strip() or None if result.returncode == 0 else None
 
-    def _repo_id(self, repo: str) -> str:
-        raw = f"{repo}|model={self._embedding_model_name()}|dim={self._model.dim}|chunker={_CHUNKER_VERSION}"
+    def _git_dirty(self, repo_dir: Path) -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_dir), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return True
+        return result.returncode != 0 or bool(result.stdout.strip())
+
+    def _repo_identity(self, repo: str, *, ref: str | None = None) -> str:
+        stripped = repo.strip()
+        if _is_git_url(stripped):
+            return f"{stripped}#ref={ref}" if ref else stripped
+        return str(Path(stripped).expanduser().resolve())
+
+    def _repo_id(self, repo: str, *, ref: str | None = None) -> str:
+        identity = self._repo_identity(repo, ref=ref)
+        raw = f"{identity}|model={self._embedding_model_name()}|dim={self._model.dim}|chunker={_CHUNKER_VERSION}"
         return self._hash(raw, size=32)
 
     def _stored_chunk(self, repo_id: str, chunk: Chunk) -> StoredChunk:
